@@ -2,10 +2,15 @@
 #include "stdint.h"
 #include "string.h"
 
+typedef enum TrapKind TrapKind;
+typedef enum FunctionKind FunctionKind;
+typedef enum CTRL CTRL;
+typedef enum NATIVE_CTRL NATIVE_CTRL;
+
 typedef struct OperandStack OperandStack;
+typedef struct LayoutStack LayoutStack;
 typedef struct Bytecode Bytecode;
 typedef struct BytecodeFunction BytecodeFunction;
-typedef enum FunctionKind FunctionKind;
 typedef struct Function Function;
 typedef struct Frame Frame;
 typedef struct CallStack CallStack;
@@ -13,17 +18,48 @@ typedef struct Handler Handler;
 typedef struct HandlerVector HandlerVector;
 typedef struct Context Context;
 typedef struct Fiber Fiber;
+typedef struct Layout Layout;
+typedef struct Trap Trap;
 
-typedef enum {
+typedef NATIVE_CTRL (*Native) (Fiber*);
+
+
+enum CTRL {
+    CTRL_EXEC,
+    CTRL_TRAP,
+};
+
+enum NATIVE_CTRL {
     NATIVE_CTRL_RETURN,
     NATIVE_CTRL_CONTINUE,
     NATIVE_CTRL_PROMPT,
     NATIVE_CTRL_STEP,
     NATIVE_CTRL_TRAP,
-} NATIVE_CTRL;
+};
 
-typedef NATIVE_CTRL (*Native) (Fiber*);
+enum FunctionKind {
+    BYTECODE_FN,
+    NATIVE_FN,
+};
 
+enum TrapKind {
+    TRAP_NOTHING,
+    TRAP_UNEXPECTED,
+    TRAP_UNREACHABLE,
+    TRAP_OPERAND_OVERFLOW,
+    TRAP_OPERAND_UNDERFLOW,
+    TRAP_CALL_OVERFLOW,
+    TRAP_CALL_UNDERFLOW,
+    TRAP_IP_OUT_OF_BOUNDS,
+    TRAP_HANDLER_OVERFLOW,
+    TRAP_HANDLER_MISSING,
+};
+
+
+struct Layout {
+    uint16_t size;
+    uint16_t align;
+};
 
 struct OperandStack {
     uint8_t* data;
@@ -31,15 +67,17 @@ struct OperandStack {
     size_t sp;
 };
 
+struct LayoutStack {
+    size_t* offsets;
+    Layout* layouts;
+    size_t size;
+    size_t sp
+};
+
 struct Bytecode {
     uint8_t* data;
     size_t size;
     size_t ep;
-};
-
-enum FunctionKind {
-    BYTECODE_FN,
-    NATIVE_FN,
 };
 
 struct Function {
@@ -81,28 +119,16 @@ struct Context {
 
 };
 
-typedef enum {
-    TRAP_NOTHING,
-    TRAP_UNEXPECTED,
-    TRAP_UNREACHABLE,
-    TRAP_OPERAND_OVERFLOW,
-    TRAP_OPERAND_UNDERFLOW,
-    TRAP_CALL_OVERFLOW,
-    TRAP_CALL_UNDERFLOW,
-    TRAP_IP_OUT_OF_BOUNDS,
-    TRAP_HANDLER_OVERFLOW,
-    TRAP_HANDLER_MISSING,
-} TrapKind;
-
-typedef struct {
+struct Trap {
     TrapKind kind;
     void* trap_data;
-} Trap;
+};
 
 
 struct Fiber {
     Context* context;
     OperandStack operand_stack;
+    LayoutStack layout_stack;
     CallStack call_stack;
     HandlerVector handler_vector;
     Trap trap;
@@ -111,18 +137,14 @@ struct Fiber {
 
 #define OP_UNREACHABLE 255 // 8xOP 0xNIL
 #define OP_NONE 0          // 8xOP 0xNIL
-#define OP_PUSH 1          // 8xOP 16xSIZE (SIZE%ALIGN)xIMM
-#define OP_POP 2           // 8xOP 16xSIZE
-#define OP_ADDR_OF 3       // 8xOP 32xDATA_OFFSET
-#define OP_LOAD 4          // 8xOP 16xSIZE
-#define OP_STORE 5         // 8xOP 16xSIZE 32xPTR_OFFSET 32xDATA_OFFSET
-#define OP_CALL 6          // 8xOP 32xPTR_OFFSET
-#define OP_RETURN 7           // 8xOP 0xNIL
+#define OP_PUSH 1          // 8xOP 16xSIZE 16xALIGN (SIZE%ALIGN)xIMM
+#define OP_POP 2           // 8xOP 16xCOUNT
+#define OP_ADDR_OF 3       // 8xOP 16xDATA_INDEX
+#define OP_LOAD 4          // 8xOP 16xSIZE 16xALIGN
+#define OP_STORE 5         // 8xOP
+#define OP_CALL 6          // 8xOP 16xFN_INDEX
+#define OP_RETURN 7        // 8xOP 0xNIL
 
-typedef enum {
-    CTRL_EXEC,
-    CTRL_TRAP,
-} CTRL;
 
 uint8_t read8(uint8_t* data, size_t offset) {
     return data[offset];
@@ -211,50 +233,131 @@ CTRL step_bc(Fiber* fiber) {
     switch (bytecode->data[frame->ip]) {
         case OP_UNREACHABLE: ctrl_trap(TRAP_UNREACHABLE, NULL);
 
-        case OP_NONE:
+        case OP_NONE: {
             frame->ip++;
-            return CTRL_EXEC;
+        } break;
 
+        case OP_PUSH: {
+            ctrl_assert( fiber->layout_stack.sp < fiber->layout_stack.size
+                       , TRAP_OPERAND_OVERFLOW, "PUSH would overflow layout stack");
 
-        // So the problem here is we don't have alignment information on the stack
-        // we align before pushing here, but when popping we only have the size
-        // .. so we need to store the alignment information in the stack as well?
-        // weird.
-        case OP_PUSH:
-            size_t offset = 1 + sizeof(uint16_t);
-            ctrl_assert( frame->ip + offset <= bytecode->size
+            size_t bc_offset = 1 + sizeof(uint16_t);
+            ctrl_assert( frame->ip + bc_offset <= bytecode->size
                        , TRAP_IP_OUT_OF_BOUNDS, "PUSH missing size parameter");
             uint16_t size = read16(bytecode->data, frame->ip + 1);
 
-            offset += sizeof(uint16_t);
-            ctrl_assert( frame->ip + offset <= bytecode->size
+            bc_offset += sizeof(uint16_t);
+            ctrl_assert( frame->ip + bc_offset <= bytecode->size
                        , TRAP_IP_OUT_OF_BOUNDS, "PUSH missing align parameter");
             uint16_t align = read16(bytecode->data, frame->ip + 1 + sizeof(uint16_t));
 
-            offset += calc_offset(frame->ip + offset, align);
-            uint8_t* source = &bytecode->data[frame->ip + offset];
-            offset += size;
-            ctrl_assert( frame->ip + offset <= bytecode->size
+            bc_offset += calc_offset(frame->ip + bc_offset, align);
+            uint8_t* source = &bytecode->data[frame->ip + bc_offset];
+            bc_offset += size;
+            ctrl_assert( frame->ip + bc_offset <= bytecode->size
                        , TRAP_IP_OUT_OF_BOUNDS, "PUSH missing operand");
 
             size_t op_pad = calc_offset(fiber->operand_stack.sp, align);
             size_t op_offset = op_pad + size;
             ctrl_assert( fiber->operand_stack.sp + op_offset <= fiber->operand_stack.size
-                       , TRAP_OPERAND_OVERFLOW, "PUSH operand is too large for the stack");
-            uint8_t* destination = &fiber->operand_stack.data[fiber->operand_stack.sp + op_pad];
+                       , TRAP_OPERAND_OVERFLOW, "PUSH operand is too large for the operand stack");
+            size_t destination_offset = fiber->operand_stack.sp + op_pad;
+            uint8_t* destination = &fiber->operand_stack.data[destination_offset];
 
             memcpy(destination, source, size);
+            fiber->layout_stack.offsets[fiber->layout_stack.sp] = destination_offset;
+            fiber->layout_stack.layouts[fiber->layout_stack.sp] = (Layout) { size, align };
+            fiber->layout_stack.sp++;
             fiber->operand_stack.sp += op_offset;
-            frame->ip += offset;
-            return CTRL_EXEC;
+            frame->ip += bc_offset;
+        } break;
 
-        case OP_POP: return exec_pop(fiber);
+        case OP_POP: {
+            size_t bc_offset = 1 + sizeof(uint16_t);
+            ctrl_assert( frame->ip + bc_offset <= bytecode->size
+                       , TRAP_IP_OUT_OF_BOUNDS, "POP missing count parameter");
 
-        case OP_ADDR_OF: return exec_addr_of(fiber);
+            uint16_t count = read16(bytecode->data, frame->ip + 1);
+            ctrl_assert( count <= fiber->layout_stack.sp
+                       , TRAP_OPERAND_UNDERFLOW, "POP would underflow layout stack");
 
-        case OP_LOAD: return exec_load(fiber);
+            fiber->layout_stack.sp -= count;
+            fiber->operand_stack.sp = fiber->layout_stack.offsets[fiber->layout_stack.sp];
+            frame->ip += bc_offset;
+        } break;
 
-        case OP_STORE: return exec_store(fiber);
+        case OP_ADDR_OF: {
+            ctrl_assert( fiber->layout_stack.sp < fiber->layout_stack.size
+                       , TRAP_OPERAND_OVERFLOW, "ADDR_OF would overflow layout stack");
+
+            ctrl_assert( fiber->operand_stack.sp + sizeof(void*) <= fiber->operand_stack.size
+                       , TRAP_OPERAND_OVERFLOW, "ADDR_OF would overflow operand stack")
+
+            size_t bc_offset = 1 + sizeof(uint16_t);
+            ctrl_assert( frame->ip + bc_offset <= bytecode->size
+                       , TRAP_IP_OUT_OF_BOUNDS, "ADDR_OF missing data index");
+
+            uint16_t data_index = read16(bytecode->data, frame->ip + 1);
+            ctrl_assert( data_index < fiber->layout_stack.sp
+                       , TRAP_OPERAND_UNDERFLOW, "ADDR_OF data index out of bounds");
+
+            void* ptr = &fiber->operand_stack.data[fiber->layout_stack.offsets[fiber->layout_stack.sp - data_index]];
+
+            memcpy(&fiber->operand_stack.data[fiber->operand_stack.sp], &ptr, sizeof(void*));
+            fiber->layout_stack.offsets[fiber->layout_stack.sp] = fiber->operand_stack.sp;
+            fiber->layout_stack.layouts[fiber->layout_stack.sp] = (Layout) { sizeof(void*), 8 };
+            fiber->layout_stack.sp++;
+            fiber->operand_stack.sp += sizeof(void*);
+            frame->ip += bc_offset;
+        } break;
+
+        case OP_LOAD: {
+            ctrl_assert( fiber->layout_stack.sp < fiber->layout_stack.size
+                       , TRAP_OPERAND_OVERFLOW, "LOAD would overflow layout stack");
+
+            ctrl_assert( fiber->layout_stack.sp >= 1
+                       , TRAP_OPERAND_UNDERFLOW, "LOAD requires one stack operand [ptr]");
+
+            ctrl_assert( fiber->operand_stack.sp + sizeof(void*) <= fiber->operand_stack.size
+                       , TRAP_OPERAND_OVERFLOW, "LOAD would overflow operand stack");
+
+            size_t bc_offset = 1 + sizeof(uint16_t) + sizeof(uint16_t);
+
+            ctrl_assert( frame->ip + bc_offset <= bytecode->size
+                       , TRAP_IP_OUT_OF_BOUNDS, "LOAD missing size or align parameter/s");
+            uint16_t size = read16(bytecode->data, frame->ip + 1);
+            uint16_t align = read16(bytecode->data, frame->ip + 1 + sizeof(uint16_t));
+
+            uint8_t** ptr = &fiber->operand_stack.data[fiber->layout_stack.offsets[fiber->layout_stack.sp - 1]];
+            size_t op_pad = calc_offset(fiber->operand_stack.sp, align);
+            size_t op_offset = op_pad + size;
+            size_t destination_offset = fiber->operand_stack.sp + op_pad;
+
+            ctrl_assert( fiber->operand_stack.sp + op_offset <= fiber->operand_stack.size
+                       , TRAP_OPERAND_OVERFLOW, "LOAD operand is too large for the operand stack");
+
+            memcpy(&fiber->operand_stack.data[destination_offset], *ptr, size);
+            fiber->layout_stack.offsets[fiber->layout_stack.sp] = destination_offset;
+            fiber->layout_stack.layouts[fiber->layout_stack.sp] = (Layout) { size, align };
+            fiber->layout_stack.sp++;
+            fiber->operand_stack.sp += op_offset;
+            frame->ip += bc_offset;
+        } break;
+
+        case OP_STORE: {
+            ctrl_assert( fiber->layout_stack.sp >= 2
+                       , TRAP_OPERAND_UNDERFLOW, "STORE requires two stack operands [ptr, val]");
+
+            size_t bc_offset = 1;
+
+            uint8_t** ptr = &fiber->operand_stack.data[fiber->layout_stack.offsets[fiber->layout_stack.sp - 2]];
+            uint8_t* val = &fiber->operand_stack.data[fiber->layout_stack.offsets[fiber->layout_stack.sp - 1]];
+
+            memcpy(*ptr, val, fiber->layout_stack.layouts[fiber->layout_stack.sp - 1].size);
+            fiber->layout_stack.sp -= 2;
+            fiber->operand_stack.sp = fiber->layout_stack.offsets[fiber->layout_stack.sp];
+            frame->ip += bc_offset;
+        } break;
 
         case OP_CALL: return exec_call(fiber);
 
@@ -262,6 +365,8 @@ CTRL step_bc(Fiber* fiber) {
 
         default: ctrl_trap(TRAP_UNEXPECTED, "invalid opcode");
     }
+
+    return CTRL_EXEC;
 }
 
 
