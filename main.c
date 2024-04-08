@@ -233,9 +233,9 @@ size_t alloca (size_t* sp, size_t size, size_t align) {
     return out;
 }
 
-bool validate_data_pointer (Context* ctx, uint8_t* ptr) {
+bool validate_data_pointer (Context* ctx, uint8_t* ptr, size_t size) {
     return ptr != NULL
-       ; // && is_data_addr(ctx, ptr);
+       ; // && is_data_addr(ctx, ptr, size);
 }
 
 bool validate_function_pointer (Context* ctx, Function* fn) {
@@ -293,6 +293,7 @@ CTRL step_bc (Fiber* fiber) {
 
             size_t offsets_sp    = alloca(&sp, num_offsets * sizeof(uint16_t), _Alignof(uint16_t));
             size_t new_locals_sp = alloca(&sp, new_function->table.size, new_function->table.align);
+            size_t new_locals_max = new_locals_sp + new_function->table.size;
 
             ctrl_assert( sp <= fiber->data_stack.mem.size
                        , TRAP_OPERAND_OVERFLOW, "CALL: operand stack overflow" );
@@ -329,6 +330,9 @@ CTRL step_bc (Fiber* fiber) {
 
             fiber->data_stack.sp = sp;
             frame->ip += 1 + 1 + 1 + num_args;
+
+            ctrl_assert( new_locals_sp <= new_locals_max
+                       , TRAP_OPERAND_OVERFLOW, "CALL: operand stack overflow" );
         } break;
 
         case OP_RET: {
@@ -375,7 +379,7 @@ CTRL step_bc (Fiber* fiber) {
 
             void* addr = *(void**) addr_reg;
 
-            ctrl_assert( validate_data_pointer(fiber->context, addr)
+            ctrl_assert( validate_data_pointer(fiber->context, addr, size)
                        , TRAP_SEGMENTATION_FAULT, "STORE_IMM: invalid dest addr" );
 
             memcpy(addr, &bytecode[frame->ip + 4], size);
@@ -396,9 +400,12 @@ CTRL step_bc (Fiber* fiber) {
             uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
             uint8_t* data_reg = &locals[frame->offsets.data[data_idx]];
 
+            ctrl_assert( table->layouts.data[addr_reg].size >= sizeof(void*)
+                       , TRAP_OPERAND_OUT_OF_BOUNDS, "STORE: addr register too small" );
+
             void* addr = *(void**) addr_reg;
 
-            ctrl_assert( validate_data_pointer(fiber->context, addr)
+            ctrl_assert( validate_data_pointer(fiber->context, addr, table->layouts.data[data_idx].size)
                        , TRAP_SEGMENTATION_FAULT, "STORE: invalid dest addr" );
 
             memcpy(addr, data_reg, table->layouts.data[data_idx].size);
@@ -419,9 +426,12 @@ CTRL step_bc (Fiber* fiber) {
             uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
             uint8_t* data_reg = &locals[frame->offsets.data[data_idx]];
 
+            ctrl_assert( table->layouts.data[addr_reg].size >= sizeof(void*)
+                       , TRAP_OPERAND_OUT_OF_BOUNDS, "LOAD: addr register too small" );
+
             void* addr = *(void**) addr_reg;
 
-            ctrl_assert( validate_data_pointer(fiber->context, addr)
+            ctrl_assert( validate_data_pointer(fiber->context, addr, table->layouts.data[data_idx].size)
                        , TRAP_SEGMENTATION_FAULT, "LOAD: invalid src addr" );
 
             memcpy(data_reg, addr, table->layouts.data[data_idx].size);
