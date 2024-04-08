@@ -1,5 +1,6 @@
 #include "stdio.h"
 #include "stdint.h"
+#include "stdbool.h"
 #include "string.h"
 
 
@@ -59,7 +60,8 @@ enum TrapKind {
     TRAP_UNEXPECTED,
     TRAP_UNREACHABLE,
     TRAP_OPERAND_OVERFLOW,
-    TRAP_OPERAND_UNDERFLOW,
+    TRAP_OPERAND_OUT_OF_BOUNDS,
+    TRAP_SEGMENTATION_FAULT,
     TRAP_CALL_OVERFLOW,
     TRAP_CALL_UNDERFLOW,
     TRAP_IP_OUT_OF_BOUNDS,
@@ -231,6 +233,16 @@ size_t alloca (size_t* sp, size_t size, size_t align) {
     return out;
 }
 
+bool validate_data_pointer (Context* ctx, uint8_t* ptr) {
+    return ptr != NULL
+       ; // && is_data_addr(ctx, ptr);
+}
+
+bool validate_function_pointer (Context* ctx, Function* fn) {
+    return fn != NULL
+       ; // && is_fun_addr(ctx, fn);
+}
+
 
 CTRL step_bc (Fiber* fiber) {
     Frame* frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
@@ -239,6 +251,9 @@ CTRL step_bc (Fiber* fiber) {
     LayoutTable* table = &function->table;
 
     uint8_t* locals = &fiber->data_stack.mem.data[frame->bp];
+
+    ctrl_assert( frame->ip < function->bytecode.size
+               , TRAP_IP_OUT_OF_BOUNDS, "IP out of bounds" );
 
     switch (bytecode[frame->ip]) {
         case OP_UNREACHABLE:
@@ -249,16 +264,28 @@ CTRL step_bc (Fiber* fiber) {
         } break;
 
         case OP_CALL: {
+            ctrl_assert( frame->ip + 4 < function->bytecode.size
+                       , TRAP_IP_OUT_OF_BOUNDS, "CALL: missing variables" );
+
             uint8_t fun_idx  = read8(bytecode, frame->ip + 1);
             uint8_t ret_idx  = read8(bytecode, frame->ip + 2);
             uint8_t num_args = read8(bytecode, frame->ip + 3);
 
+            ctrl_assert( frame->ip + 4 + num_args < function->bytecode.size
+                       , TRAP_IP_OUT_OF_BOUNDS, "CALL: missing arguments" );
+
             uint8_t* arg_idxs = &bytecode[frame->ip + 4];
+
+            ctrl_assert( (fun_idx < table->num_locals) & (ret_idx < table->num_locals)
+                       , TRAP_OPERAND_OUT_OF_BOUNDS, "CALL: register out of bounds" );
 
             uint8_t* fun_reg = &locals[frame->offsets.data[fun_idx]];
             uint8_t* ret_reg = &locals[frame->offsets.data[ret_idx]];
 
             Function* new_function = *(Function**) fun_reg;
+
+            ctrl_assert( validate_function_pointer(fiber->context, new_function)
+                       , TRAP_UNEXPECTED, "CALL: invalid function pointer" );
 
             size_t num_offsets = new_function->table.num_locals + new_function->table.num_params + 1;
 
@@ -267,7 +294,16 @@ CTRL step_bc (Fiber* fiber) {
             size_t offsets_sp    = alloca(&sp, num_offsets * sizeof(uint16_t), _Alignof(uint16_t));
             size_t new_locals_sp = alloca(&sp, new_function->table.size, new_function->table.align);
 
-            Frame new_frame = {
+            ctrl_assert( sp <= fiber->data_stack.mem.size
+                       , TRAP_OPERAND_OVERFLOW, "CALL: operand stack overflow" );
+
+            ctrl_assert( fiber->call_stack.fp + 1 < fiber->call_stack.frames.size
+                       , TRAP_CALL_OVERFLOW, "CALL: call stack overflow" );
+
+            fiber->call_stack.fp += 1;
+            Frame* new_frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
+
+            *new_frame = (Frame) {
                 .function = new_function,
                 .offsets = {
                     .data = &fiber->data_stack.mem.data[offsets_sp],
@@ -278,24 +314,20 @@ CTRL step_bc (Fiber* fiber) {
                 .ip = new_function->ep,
             };
 
-            new_frame.offsets.data[0] = calc_relative_offset(frame, new_locals_sp, ret_idx);
+            new_frame->offsets.data[0] = calc_relative_offset(frame, new_locals_sp, ret_idx);
 
             for (size_t i = 0; i < num_args; i++) {
-                new_frame.offsets.data[i + 1] = calc_relative_offset(frame, new_locals_sp, arg_idxs[i]);
+                new_frame->offsets.data[i + 1] = calc_relative_offset(frame, new_locals_sp, arg_idxs[i]);
             }
 
             for (size_t i = 0; i < new_function->table.num_locals; i++) {
                 size_t j = i + num_args + 1;
                 new_locals_sp += calc_padding(new_locals_sp, new_function->table.layouts.data[j].align);
-                new_frame.offsets.data[j] = new_locals_sp;
+                new_frame->offsets.data[j] = new_locals_sp;
                 new_locals_sp += new_function->table.layouts.data[j].size;
             }
 
             fiber->data_stack.sp = sp;
-
-            fiber->call_stack.fp += 1;
-            fiber->call_stack.frames.data[fiber->call_stack.fp] = new_frame;
-
             frame->ip += 1 + 1 + 1 + num_args;
         } break;
 
@@ -305,49 +337,94 @@ CTRL step_bc (Fiber* fiber) {
         } break;
 
         case OP_ADDR_OF: {
+            ctrl_assert( frame->ip + 5 < function->bytecode.size
+                       , TRAP_IP_OUT_OF_BOUNDS, "ADDR_OF: missing variables" );
+
             uint8_t addr_idx =  read8(bytecode, frame->ip + 1);
             uint8_t data_idx =  read8(bytecode, frame->ip + 2);
             uint16_t  offset = read16(bytecode, frame->ip + 3);
 
+            ctrl_assert( (addr_idx < table->num_locals) & (data_idx < table->num_locals)
+                       , TRAP_OPERAND_OUT_OF_BOUNDS, "ADDR_OF: register out of bounds" );
+
             uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
             uint8_t* data_reg = &locals[frame->offsets.data[data_idx]];
 
-            *(uint8_t**) addr_reg = data_reg + offset;
+            ctrl_assert( table->layouts.data[addr_reg].size >= sizeof(void*)
+                       , TRAP_OPERAND_OUT_OF_BOUNDS, "ADDR_OF: addr register too small" );
+
+            ctrl_assert( table->layouts.data[data_idx].size > offset
+                       , TRAP_OPERAND_OUT_OF_BOUNDS, "ADDR_OF: offset out of bounds" );
+
+            *(void**) addr_reg = data_reg + offset;
 
             frame->ip += 1 + 1 + 1 + 2;
         } break;
 
         case OP_STORE_IMM: {
+            ctrl_assert( frame->ip + 4 < function->bytecode.size
+                       , TRAP_IP_OUT_OF_BOUNDS, "STORE_IMM: missing variables" );
+
             uint8_t addr_idx =  read8(bytecode, frame->ip + 1);
             uint16_t    size = read16(bytecode, frame->ip + 2);
 
+            ctrl_assert( frame->ip + 4 + size < function->bytecode.size
+                       , TRAP_IP_OUT_OF_BOUNDS, "STORE_IMM: missing immediate data" );
+
             uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
 
-            memcpy(*(uint8_t**) addr_reg, &bytecode[frame->ip + 4], size);
+            void* addr = *(void**) addr_reg;
+
+            ctrl_assert( validate_data_pointer(fiber->context, addr)
+                       , TRAP_SEGMENTATION_FAULT, "STORE_IMM: invalid dest addr" );
+
+            memcpy(addr, &bytecode[frame->ip + 4], size);
 
             frame->ip += 1 + 1 + 2 + size;
         } break;
 
         case OP_STORE: {
+            ctrl_assert( frame->ip + 3 < function->bytecode.size
+                       , TRAP_IP_OUT_OF_BOUNDS, "STORE: missing variables" );
+
             uint8_t addr_idx = read8(bytecode, frame->ip + 1);
             uint8_t data_idx = read8(bytecode, frame->ip + 2);
+
+            ctrl_assert( (addr_idx < table->num_locals) & (data_idx < table->num_locals)
+                       , TRAP_OPERAND_OUT_OF_BOUNDS, "STORE: register out of bounds" );
 
             uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
             uint8_t* data_reg = &locals[frame->offsets.data[data_idx]];
 
-            memcpy(*(uint8_t**) addr_reg, data_reg, table->layouts.data[data_idx].size);
+            void* addr = *(void**) addr_reg;
+
+            ctrl_assert( validate_data_pointer(fiber->context, addr)
+                       , TRAP_SEGMENTATION_FAULT, "STORE: invalid dest addr" );
+
+            memcpy(addr, data_reg, table->layouts.data[data_idx].size);
 
             frame->ip += 1 + 1 + 1;
         } break;
 
         case OP_LOAD: {
+            ctrl_assert( frame->ip + 3 < function->bytecode.size
+                       , TRAP_IP_OUT_OF_BOUNDS, "LOAD: missing variables" );
+
             uint8_t addr_idx = read8(bytecode, frame->ip + 1);
             uint8_t data_idx = read8(bytecode, frame->ip + 2);
+
+            ctrl_assert( (addr_idx < table->num_locals) & (data_idx < table->num_locals)
+                       , TRAP_OPERAND_OUT_OF_BOUNDS, "LOAD: register out of bounds" );
 
             uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
             uint8_t* data_reg = &locals[frame->offsets.data[data_idx]];
 
-            memcpy(data_reg, *(uint8_t**) addr_reg, table->layouts.data[data_idx].size);
+            void* addr = *(void**) addr_reg;
+
+            ctrl_assert( validate_data_pointer(fiber->context, addr)
+                       , TRAP_SEGMENTATION_FAULT, "LOAD: invalid src addr" );
+
+            memcpy(data_reg, addr, table->layouts.data[data_idx].size);
 
             frame->ip += 1 + 1 + 1;
         } break;
