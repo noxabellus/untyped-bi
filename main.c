@@ -282,6 +282,9 @@ CTRL step_bc (Fiber* fiber) {
             uint8_t* fun_reg = &locals[frame->offsets.data[fun_idx]];
             uint8_t* ret_reg = &locals[frame->offsets.data[ret_idx]];
 
+            ctrl_assert( table->layouts.data[fun_reg].size >= sizeof(Function*)
+                       , TRAP_OPERAND_OUT_OF_BOUNDS, "CALL: fun register too small" );
+
             Function* new_function = *(Function**) fun_reg;
 
             ctrl_assert( validate_function_pointer(fiber->context, new_function)
