@@ -29,6 +29,7 @@ typedef NATIVE_CTRL (*Native) (Fiber*);
 #define Slice(T) Slice_ ## T
 
 typedef SLICE_T(uint8_t)  Slice(uint8_t);
+typedef SLICE_T(uint16_t) Slice(uint16_t);
 typedef SLICE_T(Layout)   Slice(Layout);
 typedef SLICE_T(Frame)    Slice(Frame);
 typedef SLICE_T(Function) Slice(Function);
@@ -70,32 +71,32 @@ enum TrapKind {
 struct Layout {
     uint16_t size;
     uint16_t align;
-    uint16_t offset;
 };
 
 struct LayoutTable {
     Slice(Layout) layouts;
+    uint32_t size;
+    uint16_t align;
     uint8_t num_params;
     uint8_t num_locals;
 };
 
-struct Bytecode {
-    Slice(uint8_t) ops;
-    size_t ep;
-};
 
 struct Function {
     LayoutTable table;
     FunctionKind kind;
+    size_t ep;
     union {
-        Bytecode* bytecode;
+        Slice(uint8_t) bytecode;
         Native* native;
     };
 };
 
 struct Frame {
     Function* function;
-    size_t sp;
+    Slice(uint16_t) offsets;
+    size_t old_sp;
+    size_t bp;
     size_t ip;
 };
 
@@ -147,7 +148,7 @@ struct Fiber {
 
 
 // call the function who's address is stored in FUN_REG
-// 1xOP + 8xFUN_REG
+// 1xOP + 8xFUN_REG + 8xRET_REG + 8xNUM_ARGS + (8*NUM_ARGS)xARG_REG
 #define OP_CALL           1
 
 // return from the current function
@@ -213,19 +214,33 @@ uint64_t read64 (uint8_t const* mem, size_t ip) {
     if (!(cond)) ctrl_trap(trap_kind, trap_message)
 
 
-size_t calc_offset(size_t addr, size_t align) {
+size_t calc_padding(size_t addr, size_t align) {
     return (addr + align - 1) & ~(align - 1);
+}
+
+size_t calc_relative_offset(Frame* frame, size_t new_bp, uint8_t idx) {
+    return frame->offsets.data[idx] + (new_bp - frame->bp);
+}
+
+size_t alloca (size_t* sp, size_t size, size_t align) {
+    size_t padding = calc_padding(*sp, align);
+
+    size_t out = *sp + padding;
+    *sp += size + padding;
+
+    return out;
 }
 
 
 CTRL step_bc (Fiber* fiber) {
     Frame* frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
-    LayoutTable* table = &frame->function->table;
-    Bytecode* bytecode = frame->function->bytecode;
+    Function* function = frame->function;
+    uint8_t* bytecode = function->bytecode.data;
+    LayoutTable* table = &function->table;
 
-    uint8_t* locals = &fiber->data_stack.mem.data[frame->sp];
+    uint8_t* locals = &fiber->data_stack.mem.data[frame->bp];
 
-    switch (bytecode->ops.data[frame->ip]) {
+    switch (bytecode[frame->ip]) {
         case OP_UNREACHABLE:
             ctrl_trap(TRAP_UNREACHABLE, "unreachable code executed");
 
@@ -233,13 +248,69 @@ CTRL step_bc (Fiber* fiber) {
             frame->ip += 1;
         } break;
 
-        case OP_ADDR_OF: {
-            uint8_t addr_idx =  read8(bytecode->ops.data, frame->ip + 1);
-            uint8_t data_idx =  read8(bytecode->ops.data, frame->ip + 2);
-            uint16_t  offset = read16(bytecode->ops.data, frame->ip + 3);
+        case OP_CALL: {
+            uint8_t fun_idx  = read8(bytecode, frame->ip + 1);
+            uint8_t ret_idx  = read8(bytecode, frame->ip + 2);
+            uint8_t num_args = read8(bytecode, frame->ip + 3);
 
-            uint8_t* addr_reg = &locals[table->layouts.data[addr_idx].offset];
-            uint8_t* data_reg = &locals[table->layouts.data[data_idx].offset];
+            uint8_t* arg_idxs = &bytecode[frame->ip + 4];
+
+            uint8_t* fun_reg = &locals[frame->offsets.data[fun_idx]];
+            uint8_t* ret_reg = &locals[frame->offsets.data[ret_idx]];
+
+            Function* new_function = *(Function**) fun_reg;
+
+            size_t num_offsets = new_function->table.num_locals + new_function->table.num_params + 1;
+
+            size_t sp = fiber->data_stack.sp;
+
+            size_t offsets_sp    = alloca(&sp, num_offsets * sizeof(uint16_t), _Alignof(uint16_t));
+            size_t new_locals_sp = alloca(&sp, new_function->table.size, new_function->table.align);
+
+            Frame new_frame = {
+                .function = new_function,
+                .offsets = {
+                    .data = &fiber->data_stack.mem.data[offsets_sp],
+                    .size = num_offsets
+                },
+                .old_sp = fiber->data_stack.sp,
+                .bp = new_locals_sp,
+                .ip = new_function->ep,
+            };
+
+            new_frame.offsets.data[0] = calc_relative_offset(frame, new_locals_sp, ret_idx);
+
+            for (size_t i = 0; i < num_args; i++) {
+                new_frame.offsets.data[i + 1] = calc_relative_offset(frame, new_locals_sp, arg_idxs[i]);
+            }
+
+            for (size_t i = 0; i < new_function->table.num_locals; i++) {
+                size_t j = i + num_args + 1;
+                new_locals_sp += calc_padding(new_locals_sp, new_function->table.layouts.data[j].align);
+                new_frame.offsets.data[j] = new_locals_sp;
+                new_locals_sp += new_function->table.layouts.data[j].size;
+            }
+
+            fiber->data_stack.sp = sp;
+
+            fiber->call_stack.fp += 1;
+            fiber->call_stack.frames.data[fiber->call_stack.fp] = new_frame;
+
+            frame->ip += 1 + 1 + 1 + num_args;
+        } break;
+
+        case OP_RET: {
+            fiber->data_stack.sp = frame->old_sp;
+            fiber->call_stack.fp -= 1;
+        } break;
+
+        case OP_ADDR_OF: {
+            uint8_t addr_idx =  read8(bytecode, frame->ip + 1);
+            uint8_t data_idx =  read8(bytecode, frame->ip + 2);
+            uint16_t  offset = read16(bytecode, frame->ip + 3);
+
+            uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
+            uint8_t* data_reg = &locals[frame->offsets.data[data_idx]];
 
             *(uint8_t**) addr_reg = data_reg + offset;
 
@@ -247,14 +318,38 @@ CTRL step_bc (Fiber* fiber) {
         } break;
 
         case OP_STORE_IMM: {
-            uint8_t addr_idx =  read8(bytecode->ops.data, frame->ip + 1);
-            uint8_t     size =  read8(bytecode->ops.data, frame->ip + 2);
+            uint8_t addr_idx =  read8(bytecode, frame->ip + 1);
+            uint16_t    size = read16(bytecode, frame->ip + 2);
 
-            uint8_t* addr_reg = &locals[table->layouts.data[addr_idx].offset];
+            uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
 
-            // TODO: read immediate value into addr_reg
+            memcpy(*(uint8_t**) addr_reg, &bytecode[frame->ip + 4], size);
 
-            frame->ip += 1 + 1 + 1 + size;
+            frame->ip += 1 + 1 + 2 + size;
+        } break;
+
+        case OP_STORE: {
+            uint8_t addr_idx = read8(bytecode, frame->ip + 1);
+            uint8_t data_idx = read8(bytecode, frame->ip + 2);
+
+            uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
+            uint8_t* data_reg = &locals[frame->offsets.data[data_idx]];
+
+            memcpy(*(uint8_t**) addr_reg, data_reg, table->layouts.data[data_idx].size);
+
+            frame->ip += 1 + 1 + 1;
+        } break;
+
+        case OP_LOAD: {
+            uint8_t addr_idx = read8(bytecode, frame->ip + 1);
+            uint8_t data_idx = read8(bytecode, frame->ip + 2);
+
+            uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
+            uint8_t* data_reg = &locals[frame->offsets.data[data_idx]];
+
+            memcpy(data_reg, *(uint8_t**) addr_reg, table->layouts.data[data_idx].size);
+
+            frame->ip += 1 + 1 + 1;
         } break;
     }
 
