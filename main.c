@@ -97,7 +97,7 @@ struct Function {
 
 struct Frame {
     Function* function;
-    Slice(uint16_t) offsets;
+    Slice(uint16_t) param_offsets;
     size_t old_sp;
     size_t bp;
     size_t ip;
@@ -221,8 +221,14 @@ size_t calc_padding(size_t addr, size_t align) {
     return (addr + align - 1) & ~(align - 1);
 }
 
-size_t calc_relative_offset(Frame* frame, size_t new_bp, uint8_t idx) {
-    return frame->offsets.data[idx] + (new_bp - frame->bp);
+uint16_t select_reg(Frame* frame, uint8_t idx) {
+    uint16_t* a = frame->function->table.local_offsets + idx;
+    uint16_t* b = frame->param_offsets.data + (idx - 128);
+    return *(idx < 128? a : b); // cmovns https://godbolt.org/z/v6r6ThsWf
+}
+
+uint16_t calc_relative_offset(Frame* frame, size_t new_bp, uint8_t idx) {
+    return select_reg(frame, idx) + (new_bp - frame->bp);
 }
 
 size_t alloca (size_t* sp, size_t size, size_t align) {
@@ -280,8 +286,8 @@ CTRL step_bc (Fiber* fiber) {
             ctrl_assert( (fun_idx < table->num_locals) & (ret_idx < table->num_locals)
                        , TRAP_OPERAND_OUT_OF_BOUNDS, "CALL: register out of bounds" );
 
-            uint8_t* fun_reg = &locals[frame->offsets.data[fun_idx]];
-            uint8_t* ret_reg = &locals[frame->offsets.data[ret_idx]];
+            uint8_t* fun_reg = &locals[select_reg(frame, fun_idx)];
+            uint8_t* ret_reg = &locals[select_reg(frame, ret_idx)];
 
             ctrl_assert( table->layouts.data[fun_reg].size >= sizeof(Function*)
                        , TRAP_OPERAND_OUT_OF_BOUNDS, "CALL: fun register too small" );
@@ -306,23 +312,19 @@ CTRL step_bc (Fiber* fiber) {
                        , TRAP_CALL_OVERFLOW, "CALL: call stack overflow" );
 
             fiber->call_stack.fp += 1;
+
             Frame* new_frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
+            new_frame->function = new_function;
+            new_frame->param_offsets.data = &fiber->data_stack.mem.data[offsets_sp],
+            new_frame->param_offsets.size = num_inputs + new_function->table.num_locals,
+            new_frame->old_sp = fiber->data_stack.sp,
+            new_frame->bp = new_locals_sp,
+            new_frame->ip = new_function->ep;
 
-            *new_frame = (Frame) {
-                .function = new_function,
-                .offsets = {
-                    .data = &fiber->data_stack.mem.data[offsets_sp],
-                    .size = num_inputs + new_function->table.num_locals,
-                },
-                .old_sp = fiber->data_stack.sp,
-                .bp = new_locals_sp,
-                .ip = new_function->ep,
-            };
+            new_frame->param_offsets.data[0] = calc_relative_offset(frame, new_locals_sp, ret_idx);
 
-            new_frame->offsets.data[0] = calc_relative_offset(frame, new_locals_sp, ret_idx);
-
-            switch (num_args) {
-                #define CASE(N) case N: new_frame->offsets.data[N] = calc_relative_offset(frame, new_locals_sp, arg_idxs[N - 1])
+            switch (num_args) { // loop -> single branch optimization https://godbolt.org/z/6hebcGraz
+                #define CASE(N) case N: new_frame->param_offsets.data[N] = calc_relative_offset(frame, new_locals_sp, arg_idxs[N - 1])
                     CASE(128); CASE(127); CASE(126); CASE(125); CASE(124); CASE(123); CASE(122); CASE(121); CASE(120);
                     CASE(119); CASE(118); CASE(117); CASE(116); CASE(115); CASE(114); CASE(113); CASE(112); CASE(111);
                     CASE(110); CASE(109); CASE(108); CASE(107); CASE(106); CASE(105); CASE(104); CASE(103); CASE(102);
@@ -342,10 +344,6 @@ CTRL step_bc (Fiber* fiber) {
                 case 0: break;
                 default: ctrl_trap(TRAP_UNEXPECTED, "CALL: too many arguments");
             }
-
-            memcpy( &new_frame->offsets.data[num_inputs]
-                  , new_function->table.local_offsets
-                  , new_function->table.num_locals * sizeof(uint16_t) );
 
             fiber->data_stack.sp = sp;
             frame->ip += 1 + 1 + 1 + num_args;
@@ -367,8 +365,8 @@ CTRL step_bc (Fiber* fiber) {
             ctrl_assert( (addr_idx < table->num_locals) & (data_idx < table->num_locals)
                        , TRAP_OPERAND_OUT_OF_BOUNDS, "ADDR_OF: register out of bounds" );
 
-            uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
-            uint8_t* data_reg = &locals[frame->offsets.data[data_idx]];
+            uint8_t* addr_reg = &locals[select_reg(addr_idx)];
+            uint8_t* data_reg = &locals[select_reg(data_idx)];
 
             ctrl_assert( table->layouts.data[addr_reg].size >= sizeof(void*)
                        , TRAP_OPERAND_OUT_OF_BOUNDS, "ADDR_OF: addr register too small" );
@@ -391,7 +389,7 @@ CTRL step_bc (Fiber* fiber) {
             ctrl_assert( frame->ip + 4 + size < function->bytecode.size
                        , TRAP_IP_OUT_OF_BOUNDS, "STORE_IMM: missing immediate data" );
 
-            uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
+            uint8_t* addr_reg = &locals[select_reg(addr_idx)];
 
             void* addr = *(void**) addr_reg;
 
@@ -413,8 +411,8 @@ CTRL step_bc (Fiber* fiber) {
             ctrl_assert( (addr_idx < table->num_locals) & (data_idx < table->num_locals)
                        , TRAP_OPERAND_OUT_OF_BOUNDS, "STORE: register out of bounds" );
 
-            uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
-            uint8_t* data_reg = &locals[frame->offsets.data[data_idx]];
+            uint8_t* addr_reg = &locals[select_reg(addr_idx)];
+            uint8_t* data_reg = &locals[select_reg(data_idx)];
 
             ctrl_assert( table->layouts.data[addr_reg].size >= sizeof(void*)
                        , TRAP_OPERAND_OUT_OF_BOUNDS, "STORE: addr register too small" );
@@ -439,8 +437,8 @@ CTRL step_bc (Fiber* fiber) {
             ctrl_assert( (addr_idx < table->num_locals) & (data_idx < table->num_locals)
                        , TRAP_OPERAND_OUT_OF_BOUNDS, "LOAD: register out of bounds" );
 
-            uint8_t* addr_reg = &locals[frame->offsets.data[addr_idx]];
-            uint8_t* data_reg = &locals[frame->offsets.data[data_idx]];
+            uint8_t* addr_reg = &locals[select_reg(addr_idx)];
+            uint8_t* data_reg = &locals[select_reg(data_idx)];
 
             ctrl_assert( table->layouts.data[addr_reg].size >= sizeof(void*)
                        , TRAP_OPERAND_OUT_OF_BOUNDS, "LOAD: addr register too small" );
