@@ -77,6 +77,7 @@ struct Layout {
 
 struct LayoutTable {
     Slice(Layout) layouts;
+    uint16_t* local_offsets;
     uint32_t size;
     uint16_t align;
     uint8_t num_params;
@@ -290,11 +291,11 @@ CTRL step_bc (Fiber* fiber) {
             ctrl_assert( validate_function_pointer(fiber->context, new_function)
                        , TRAP_UNEXPECTED, "CALL: invalid function pointer" );
 
-            size_t num_offsets = new_function->table.num_locals + new_function->table.num_params + 1;
+            size_t num_inputs = new_function->table.num_params + 1;
 
             size_t sp = fiber->data_stack.sp;
 
-            size_t offsets_sp    = alloca(&sp, num_offsets * sizeof(uint16_t), _Alignof(uint16_t));
+            size_t offsets_sp    = alloca(&sp, num_inputs * sizeof(uint16_t), _Alignof(uint16_t));
             size_t new_locals_sp = alloca(&sp, new_function->table.size, new_function->table.align);
             size_t new_locals_max = new_locals_sp + new_function->table.size;
 
@@ -311,7 +312,7 @@ CTRL step_bc (Fiber* fiber) {
                 .function = new_function,
                 .offsets = {
                     .data = &fiber->data_stack.mem.data[offsets_sp],
-                    .size = num_offsets
+                    .size = num_inputs + new_function->table.num_locals,
                 },
                 .old_sp = fiber->data_stack.sp,
                 .bp = new_locals_sp,
@@ -320,22 +321,34 @@ CTRL step_bc (Fiber* fiber) {
 
             new_frame->offsets.data[0] = calc_relative_offset(frame, new_locals_sp, ret_idx);
 
-            for (size_t i = 0; i < num_args; i++) {
-                new_frame->offsets.data[i + 1] = calc_relative_offset(frame, new_locals_sp, arg_idxs[i]);
+            switch (num_args) {
+                #define CASE(N) case N: new_frame->offsets.data[N] = calc_relative_offset(frame, new_locals_sp, arg_idxs[N - 1])
+                    CASE(128); CASE(127); CASE(126); CASE(125); CASE(124); CASE(123); CASE(122); CASE(121); CASE(120);
+                    CASE(119); CASE(118); CASE(117); CASE(116); CASE(115); CASE(114); CASE(113); CASE(112); CASE(111);
+                    CASE(110); CASE(109); CASE(108); CASE(107); CASE(106); CASE(105); CASE(104); CASE(103); CASE(102);
+                    CASE(101); CASE(100); CASE( 99); CASE( 98); CASE( 97); CASE( 96); CASE( 95); CASE( 94); CASE( 93);
+                    CASE( 92); CASE( 91); CASE( 90); CASE( 89); CASE( 88); CASE( 87); CASE( 86); CASE( 85); CASE( 84);
+                    CASE( 83); CASE( 82); CASE( 81); CASE( 80); CASE( 79); CASE( 78); CASE( 77); CASE( 76); CASE( 75);
+                    CASE( 74); CASE( 73); CASE( 72); CASE( 71); CASE( 70); CASE( 69); CASE( 68); CASE( 67); CASE( 66);
+                    CASE( 65); CASE( 64); CASE( 63); CASE( 62); CASE( 61); CASE( 60); CASE( 59); CASE( 58); CASE( 57);
+                    CASE( 56); CASE( 55); CASE( 54); CASE( 53); CASE( 52); CASE( 51); CASE( 50); CASE( 49); CASE( 48);
+                    CASE( 47); CASE( 46); CASE( 45); CASE( 44); CASE( 43); CASE( 42); CASE( 41); CASE( 40); CASE( 39);
+                    CASE( 38); CASE( 37); CASE( 36); CASE( 35); CASE( 34); CASE( 33); CASE( 32); CASE( 31); CASE( 30);
+                    CASE( 29); CASE( 28); CASE( 27); CASE( 26); CASE( 25); CASE( 24); CASE( 23); CASE( 22); CASE( 21);
+                    CASE( 20); CASE( 19); CASE( 18); CASE( 17); CASE( 16); CASE( 15); CASE( 14); CASE( 13); CASE( 12);
+                    CASE( 11); CASE( 10); CASE(  9); CASE(  8); CASE(  7); CASE(  6); CASE(  5); CASE(  4); CASE(  3);
+                    CASE(  2); CASE(  1);
+                #undef CASE
+                case 0: break;
+                default: ctrl_trap(TRAP_UNEXPECTED, "CALL: too many arguments");
             }
 
-            for (size_t i = 0; i < new_function->table.num_locals; i++) {
-                size_t j = i + num_args + 1;
-                new_locals_sp += calc_padding(new_locals_sp, new_function->table.layouts.data[j].align);
-                new_frame->offsets.data[j] = new_locals_sp;
-                new_locals_sp += new_function->table.layouts.data[j].size;
-            }
+            memcpy( &new_frame->offsets.data[num_inputs]
+                  , new_function->table.local_offsets
+                  , new_function->table.num_locals * sizeof(uint16_t) );
 
             fiber->data_stack.sp = sp;
             frame->ip += 1 + 1 + 1 + num_args;
-
-            ctrl_assert( new_locals_sp <= new_locals_max
-                       , TRAP_OPERAND_OVERFLOW, "CALL: operand stack overflow" );
         } break;
 
         case OP_RET: {
