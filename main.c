@@ -78,6 +78,16 @@ typedef ENUM_T(uint8_t) {
     OP_JMP_IF,
 
 
+    // Prompt the handler at a given HANDLER_INDEX
+    // 8xOP + 16xHANDLER_INDEX + 8xNUM_ARGS + 8xRET_REG
+    // [(8*NUM_ARGS)xARG_REGS]
+    OP_PROMPT,
+
+    // Return control from the current handler
+    // 8xOP
+    OP_CONTINUE,
+
+
     // create a handler from FUN_COUNT functions at the addresses stored in FUN_REGS,
     // placing the result in OUT_REG
     // 8xOP + 8xFUN_COUNT + 8xOUT_REG
@@ -102,17 +112,6 @@ typedef ENUM_T(uint8_t) {
     // offsets the handlers thereafter
     // 8xOP + 16xHANDLER_INDEX
     OP_REMOVE_HANDLER,
-
-
-
-    // Prompt the handler at a given HANDLER_INDEX
-    // 8xOP + 8xNUM_ARGS + 16xHANDLER_INDEX + 8xRET_REG
-    // [(8*NUM_ARGS)xARG_REGS]
-    OP_PROMPT,
-
-    // Return control from the current handler
-    // 8xOP
-    OP_CONTINUE,
 
 
     // copy the address of a register in a DATA_REG
@@ -362,6 +361,7 @@ struct Function {
 
 struct Frame {
     Function* function;
+    Handler* handler;
     Slice(uint16_t) param_offsets;
     size_t old_sp;
     size_t bp;
@@ -571,6 +571,7 @@ Control step_bc (Fiber* fiber) {
 
             Frame* new_frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
             new_frame->function = new_function;
+            new_frame->handler = NULL;
             new_frame->param_offsets.data = (void*) &fiber->data_stack.mem.data[offsets_sp],
             new_frame->param_offsets.size = num_inputs + new_function->table.num_locals,
             new_frame->old_sp = fiber->data_stack.sp,
@@ -581,6 +582,7 @@ Control step_bc (Fiber* fiber) {
 
             switch (num_args) { // loop -> single branch optimization https://godbolt.org/z/6hebcGraz
                 case 0: break;
+
 
                 #define CASE(N)                                                                                         \
                     case N: {                                                                                           \
@@ -608,6 +610,7 @@ Control step_bc (Fiber* fiber) {
 
                 #undef CASE
 
+
                 default:
                     ctrl_trap(TRAP_UNEXPECTED, "CALL: too many arguments");
             }
@@ -618,6 +621,12 @@ Control step_bc (Fiber* fiber) {
 
 
         case OP_RET: {
+            if (frame->handler && frame->handler->cases.size) {
+                Function* return_case = frame->handler->cases.data[0];
+                if (return_case) {
+                    // TODO not sure exactly what needs to happen here
+                }
+            }
             fiber->data_stack.sp = frame->old_sp;
             fiber->call_stack.fp -= 1;
         } break;
@@ -661,6 +670,115 @@ Control step_bc (Fiber* fiber) {
             if (*cond_reg != 0) {
                 frame->ip += offset;
             }
+        } break;
+
+
+        case OP_PROMPT: {
+            ctrl_assert( frame->ip + 1 + 2 + 1 + 1 + 1 < function->bytecode.size
+                       , TRAP_IP_OUT_OF_BOUNDS
+                       , "PROMPT: missing variables" );
+
+            uint16_t handler_idx = read16(bytecode, frame->ip + 1);
+            uint8_t     case_idx =  read8(bytecode, frame->ip + 1 + 2);
+            uint8_t     num_args =  read8(bytecode, frame->ip + 1 + 2 + 1);
+            uint8_t      ret_idx =  read8(bytecode, frame->ip + 1 + 2 + 1 + 1);
+
+            ctrl_assert( handler_idx < fiber->handler_vector.handlers.size
+                       , TRAP_OPERAND_OUT_OF_BOUNDS
+                       , "PROMPT: handler index out of bounds" );
+
+            ctrl_assert( validate_reg(table, ret_idx)
+                       , TRAP_OPERAND_OUT_OF_BOUNDS
+                       , "PROMPT: register out of bounds" );
+
+            ctrl_assert( frame->ip + 1 + 2 + 1 + 1 + 1 + num_args < function->bytecode.size
+                       , TRAP_IP_OUT_OF_BOUNDS
+                       , "PROMPT: missing arguments" );
+
+            Handler* handler = &fiber->handler_vector.handlers.data[handler_idx];
+
+            ctrl_assert( case_idx + 1 < handler->cases.size
+                       , TRAP_OPERAND_OUT_OF_BOUNDS
+                       , "PROMPT: case index out of bounds" );
+
+            Function* new_function = handler->cases.data[case_idx + 1];
+
+            size_t num_inputs = new_function->table.num_params + 1;
+
+            size_t sp = fiber->data_stack.sp;
+
+            size_t offsets_sp     = stack_alloc(&sp, num_inputs * sizeof(uint16_t), _Alignof(uint16_t));
+            size_t new_locals_sp  = stack_alloc(&sp, new_function->table.size, new_function->table.align);
+            size_t new_locals_max = new_locals_sp + new_function->table.size;
+
+            ctrl_assert( sp <= fiber->data_stack.mem.size
+                       , TRAP_OPERAND_OVERFLOW
+                       , "PROMPT: operand stack overflow" );
+
+            ctrl_assert( fiber->call_stack.fp + 1 < fiber->call_stack.frames.size
+                       , TRAP_CALL_OVERFLOW
+                       , "PROMPT: call stack overflow" );
+
+            fiber->call_stack.fp += 1;
+
+            Frame* new_frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
+            new_frame->function = new_function;
+            new_frame->handler = handler;
+            new_frame->param_offsets.data = (void*) &fiber->data_stack.mem.data[offsets_sp],
+            new_frame->param_offsets.size = num_inputs + new_function->table.num_locals,
+            new_frame->old_sp = fiber->data_stack.sp,
+            new_frame->bp = new_locals_sp,
+            new_frame->ip = new_function->ep;
+
+            new_frame->param_offsets.data[0] = calc_relative_offset(frame, new_locals_sp, ret_idx);
+
+            switch (num_args) { // loop -> single branch optimization https://godbolt.org/z/6hebcGraz
+                case 0: break;
+
+
+                #define CASE(N)                                                                                         \
+                    case N: {                                                                                           \
+                        ctrl_assert( validate_reg(table, arg_idxs[N - 1])                                               \
+                                   , TRAP_OPERAND_OUT_OF_BOUNDS                                                         \
+                                   , "PROMPT: argument register out of bounds" );                                       \
+                        new_frame->param_offsets.data[N] = calc_relative_offset(frame, new_locals_sp, arg_idxs[N - 1]); \
+                    }                                                                                                   \
+
+                CASE(128); CASE(127); CASE(126); CASE(125); CASE(124); CASE(123); CASE(122); CASE(121); CASE(120);
+                CASE(119); CASE(118); CASE(117); CASE(116); CASE(115); CASE(114); CASE(113); CASE(112); CASE(111);
+                CASE(110); CASE(109); CASE(108); CASE(107); CASE(106); CASE(105); CASE(104); CASE(103); CASE(102);
+                CASE(101); CASE(100); CASE( 99); CASE( 98); CASE( 97); CASE( 96); CASE( 95); CASE( 94); CASE( 93);
+                CASE( 92); CASE( 91); CASE( 90); CASE( 89); CASE( 88); CASE( 87); CASE( 86); CASE( 85); CASE( 84);
+                CASE( 83); CASE( 82); CASE( 81); CASE( 80); CASE( 79); CASE( 78); CASE( 77); CASE( 76); CASE( 75);
+                CASE( 74); CASE( 73); CASE( 72); CASE( 71); CASE( 70); CASE( 69); CASE( 68); CASE( 67); CASE( 66);
+                CASE( 65); CASE( 64); CASE( 63); CASE( 62); CASE( 61); CASE( 60); CASE( 59); CASE( 58); CASE( 57);
+                CASE( 56); CASE( 55); CASE( 54); CASE( 53); CASE( 52); CASE( 51); CASE( 50); CASE( 49); CASE( 48);
+                CASE( 47); CASE( 46); CASE( 45); CASE( 44); CASE( 43); CASE( 42); CASE( 41); CASE( 40); CASE( 39);
+                CASE( 38); CASE( 37); CASE( 36); CASE( 35); CASE( 34); CASE( 33); CASE( 32); CASE( 31); CASE( 30);
+                CASE( 29); CASE( 28); CASE( 27); CASE( 26); CASE( 25); CASE( 24); CASE( 23); CASE( 22); CASE( 21);
+                CASE( 20); CASE( 19); CASE( 18); CASE( 17); CASE( 16); CASE( 15); CASE( 14); CASE( 13); CASE( 12);
+                CASE( 11); CASE( 10); CASE(  9); CASE(  8); CASE(  7); CASE(  6); CASE(  5); CASE(  4); CASE(  3);
+                CASE(  2); CASE(  1);
+
+                #undef CASE
+
+
+                default:
+                    ctrl_trap(TRAP_UNEXPECTED, "PROMPT: too many arguments");
+            }
+
+            fiber->data_stack.sp = sp;
+            frame->ip += 1 + 2 + 1 + 1 + 1 + num_args;
+        } break;
+
+
+        case OP_CONTINUE: {
+            ctrl_assert( frame->handler != NULL
+                       , TRAP_UNEXPECTED
+                       , "CONTINUE: no handler" );
+
+            fiber->data_stack.sp = frame->old_sp;
+            fiber->call_stack.fp -= 1;
         } break;
 
 
@@ -872,17 +990,13 @@ Control step_bc (Fiber* fiber) {
         } break;
 
 
-        case OP_PROMPT: {
-            // TODO
-        } break;
-
-
-        case OP_CONTINUE: {
-            // TODO
-        } break;
-
-
         case OP_UP_VALUE_ADDR: {
+            Handler* handler = frame->handler;
+
+            ctrl_assert( handler != NULL
+                       , TRAP_UNEXPECTED
+                       , "UP_VALUE_ADDR: no handler" );
+
             ctrl_assert( frame->ip + 1 + 2 + 1 + 1 < function->bytecode.size
                        , TRAP_IP_OUT_OF_BOUNDS
                        , "UP_VALUE_ADDR: missing variables" );
@@ -891,9 +1005,7 @@ Control step_bc (Fiber* fiber) {
             uint8_t addr_idx =  read8(bytecode, frame->ip + 1 + 2);
             uint8_t data_idx =  read8(bytecode, frame->ip + 1 + 2 + 1);
 
-            // TODO: get the frame of the handler
-            // we need to store this somewhere
-            Frame* up_frame;
+            Frame* up_frame = fiber->call_stack.frames.data[handler->fp];
 
             ctrl_assert( validate_reg(table, addr_idx)
                        & validate_reg(&up_frame->table, data_idx)
