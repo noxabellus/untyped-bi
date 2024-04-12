@@ -621,12 +621,16 @@ Control step_bc (Fiber* fiber) {
 
 
         case OP_RET: {
-            if (frame->handler && frame->handler->cases.size) {
-                Function* return_case = frame->handler->cases.data[0];
-                if (return_case) {
-                    // TODO not sure exactly what needs to happen here
-                }
-            }
+            // this is completely wrongulent.
+            // the use of handler return cases does not work this way
+            // it could happen in any function, not just handler function calls
+            // and really it depends on the context of the caller not the callee
+            // if (frame->handler && frame->handler->cases.size) {
+            //     Function* return_case = frame->handler->cases.data[0];
+            //     if (return_case) {
+            //         // TODO not sure exactly what needs to happen here
+            //     }
+            // }
             fiber->data_stack.sp = frame->old_sp;
             fiber->call_stack.fp -= 1;
         } break;
