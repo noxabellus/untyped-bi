@@ -41,12 +41,9 @@ typedef ENUM_T(uint8_t) {
     TRAP_UNREACHABLE,
     TRAP_OPERAND_OVERFLOW,
     TRAP_OPERAND_OUT_OF_BOUNDS,
-    TRAP_SEGMENTATION_FAULT,
     TRAP_CALL_OVERFLOW,
-    TRAP_CALL_UNDERFLOW,
     TRAP_IP_OUT_OF_BOUNDS,
     TRAP_HANDLER_OVERFLOW,
-    TRAP_HANDLER_MISSING,
 } TrapKind;
 
 typedef ENUM_T(uint8_t) {
@@ -442,13 +439,13 @@ uint64_t read64 (uint8_t const* mem, size_t ip) {
 
 
 #define ctrl_trap(trap_kind, trap_message) { \
-    fiber->trap.kind = trap_kind; \
-    fiber->trap.message = trap_message; \
-    return CTRL_TRAP; \
-}
+    fiber->trap.kind = trap_kind;            \
+    fiber->trap.message = trap_message;      \
+    return CTRL_TRAP;                        \
+}                                            \
 
-#define ctrl_assert(cond, trap_kind, trap_message) \
-    if (!(cond)) ctrl_trap(trap_kind, trap_message)
+#define ctrl_assert(cond, trap_kind, trap_message)  \
+    if (!(cond)) ctrl_trap(trap_kind, trap_message) \
 
 
 static inline
@@ -1093,7 +1090,7 @@ Control step_bc (Fiber* fiber) {
             void* addr = *(void**) addr_reg;
 
             ctrl_assert( validate_data_pointer(fiber->context, addr, size)
-                       , TRAP_SEGMENTATION_FAULT
+                       , TRAP_OPERAND_OUT_OF_BOUNDS
                        , "STORE_IMM: invalid dest addr" );
 
             memcpy(addr, &bytecode[frame->ip + 1 + 1 + 2], size);
@@ -1125,7 +1122,7 @@ Control step_bc (Fiber* fiber) {
             void* addr = *(void**) addr_reg;
 
             ctrl_assert( validate_data_pointer(fiber->context, addr, table->layouts.data[data_idx].size)
-                       , TRAP_SEGMENTATION_FAULT
+                       , TRAP_OPERAND_OUT_OF_BOUNDS
                        , "STORE: invalid dest addr" );
 
             memcpy(addr, data_reg, table->layouts.data[data_idx].size);
@@ -1157,7 +1154,7 @@ Control step_bc (Fiber* fiber) {
             void* addr = *(void**) addr_reg;
 
             ctrl_assert( validate_data_pointer(fiber->context, addr, table->layouts.data[data_idx].size)
-                       , TRAP_SEGMENTATION_FAULT
+                       , TRAP_OPERAND_OUT_OF_BOUNDS
                        , "LOAD: invalid src addr" );
 
             memcpy(data_reg, addr, table->layouts.data[data_idx].size);
