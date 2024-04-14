@@ -57,6 +57,7 @@ typedef ENUM_T(uint8_t) {
 
 
     // call the function at the address stored in FUN_REG
+    // passing it ARG_REGS as arguments, and placing the result in RET_REG
     // 8xOP + 8xNUM_ARGS + 8xFUN_REG + 8xRET_REG
     // [(8*NUM_ARGS)xARG_REGS]
     OP_CALL,
@@ -84,31 +85,16 @@ typedef ENUM_T(uint8_t) {
     // 8xOP
     OP_CONTINUE,
 
+    // TODO: this would work but it's not very efficient
+    //       as we would need to create lexical closures and WITH calls for every handler
+    // call the function at the address stored in FUN_REG
+    // 8xOP + 16xHANDLER_INDEX + 8xNUM_ARGS + 8xFUN_REG + 8xRET_REG
+    // passing it ARG_REGS as arguments, and placing the result in RET_REG
+    // using the HANDLER provided as an immediate to handle the effect at HANDLER_INDEX
+    // [(8*NUM_ARGS)xARG_REGS]
+    // [sizeof(Handler)xHANDLER]
+    OP_WITH_HANDLER,
 
-    // create a handler from FUN_COUNT functions at the addresses stored in FUN_REGS,
-    // placing the result in OUT_REG
-    // 8xOP + 8xFUN_COUNT + 8xOUT_REG
-    // [(FUN_COUNT*8)xFUN_REG]
-    OP_NEW_HANDLER,
-
-    // copy the handler from the IN_REG into the handler vector at the HANDLER_INDEX
-    // offsets the handlers thereafter
-    // 8xOP + 16xHANDLER_INDEX + 8xIN_REG
-    OP_INSERT_HANDLER,
-
-    // copy the handler from the HANDLER_INDEX in the handler vector into the INOUT_REG,
-    // replacing the handler at that index with the one that was in INOUT_REG
-    // 8xOP + 16xHANDLER_INDEX + 8xINOUT_REG
-    OP_SWAP_HANDLER,
-
-    // copy the HANDLER_INDEX from the handler vector, placing it in the OUT_REG
-    // 8xOP + 16xHANDLER_INDEX + 8xOUT_REG
-    OP_COPY_HANDLER,
-
-    // remove the HANDLER_INDEX from the handler vector
-    // offsets the handlers thereafter
-    // 8xOP + 16xHANDLER_INDEX
-    OP_REMOVE_HANDLER,
 
 
     // copy the address of a register in a DATA_REG
@@ -871,124 +857,124 @@ Control step_bc (Fiber* fiber) {
         } break;
 
 
-        case OP_INSERT_HANDLER: {
-            ctrl_assert( fiber->handler_vector.handlers.size < fiber->handler_vector.handlers.capacity
-                       , TRAP_HANDLER_OVERFLOW
-                       , NULL );
+        // case OP_INSERT_HANDLER: {
+        //     ctrl_assert( fiber->handler_vector.handlers.size < fiber->handler_vector.handlers.capacity
+        //                , TRAP_HANDLER_OVERFLOW
+        //                , NULL );
 
-            ctrl_assert( frame->ip + 1 + 2 + 1 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "INSERT_HANDLER: missing variables" );
+        //     ctrl_assert( frame->ip + 1 + 2 + 1 < function->bytecode.size
+        //                , TRAP_IP_OUT_OF_BOUNDS
+        //                , "INSERT_HANDLER: missing variables" );
 
-            uint16_t handler_idx = read16(bytecode, frame->ip + 1);
-            uint8_t       in_idx =  read8(bytecode, frame->ip + 1 + 2);
+        //     uint16_t handler_idx = read16(bytecode, frame->ip + 1);
+        //     uint8_t       in_idx =  read8(bytecode, frame->ip + 1 + 2);
 
-            ctrl_assert( validate_reg(table, in_idx)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "INSERT_HANDLER: register out of bounds" );
+        //     ctrl_assert( validate_reg(table, in_idx)
+        //                , TRAP_OPERAND_OUT_OF_BOUNDS
+        //                , "INSERT_HANDLER: register out of bounds" );
 
-            uint8_t* in_reg = &locals[select_reg(frame, in_idx)];
+        //     uint8_t* in_reg = &locals[select_reg(frame, in_idx)];
 
-            ctrl_assert( table->layouts.data[in_idx].size >= sizeof(Handler)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "INSERT_HANDLER: in register too small" );
+        //     ctrl_assert( table->layouts.data[in_idx].size >= sizeof(Handler)
+        //                , TRAP_OPERAND_OUT_OF_BOUNDS
+        //                , "INSERT_HANDLER: in register too small" );
 
-            Handler* handler = (Handler*) in_reg;
+        //     Handler* handler = (Handler*) in_reg;
 
-            ctrl_assert( handler_idx <= fiber->handler_vector.handlers.size
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "INSERT_HANDLER: handler index out of bounds" );
+        //     ctrl_assert( handler_idx <= fiber->handler_vector.handlers.size
+        //                , TRAP_OPERAND_OUT_OF_BOUNDS
+        //                , "INSERT_HANDLER: handler index out of bounds" );
 
-            memmove( &fiber->handler_vector.handlers.data[handler_idx + 1]
-                   , &fiber->handler_vector.handlers.data[handler_idx]
-                   , (fiber->handler_vector.handlers.size - handler_idx) * sizeof(Handler));
+        //     memmove( &fiber->handler_vector.handlers.data[handler_idx + 1]
+        //            , &fiber->handler_vector.handlers.data[handler_idx]
+        //            , (fiber->handler_vector.handlers.size - handler_idx) * sizeof(Handler));
 
-            fiber->handler_vector.handlers.data[handler_idx] = *handler;
+        //     fiber->handler_vector.handlers.data[handler_idx] = *handler;
 
-            frame->ip += 1 + 2 + 1;
-        } break;
-
-
-        case OP_SWAP_HANDLER: {
-            ctrl_assert( frame->ip + 1 + 2 + 1 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "SWAP_HANDLER: missing variables" );
-
-            uint16_t handler_idx = read16(bytecode, frame->ip + 1);
-            uint8_t    inout_idx =  read8(bytecode, frame->ip + 1 + 2);
-
-            ctrl_assert( handler_idx < fiber->handler_vector.handlers.size
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "SWAP_HANDLER: handler index out of bounds" );
-
-            ctrl_assert( validate_reg(table, inout_idx)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "SWAP_HANDLER: register out of bounds" );
-
-            uint8_t* inout_reg = &locals[select_reg(frame, inout_idx)];
-
-            ctrl_assert( table->layouts.data[inout_idx].size >= sizeof(Handler)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "SWAP_HANDLER: inout register too small" );
-
-            Handler* inout = (Handler*) inout_reg;
-
-            Handler tmp = fiber->handler_vector.handlers.data[handler_idx];
-
-            fiber->handler_vector.handlers.data[handler_idx] = *inout;
-            *inout = tmp;
-
-            frame->ip += 1 + 2;
-        } break;
+        //     frame->ip += 1 + 2 + 1;
+        // } break;
 
 
-        case OP_COPY_HANDLER: {
-            ctrl_assert( frame->ip + 1 + 2 + 1 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "TAKE_HANDLER: missing variables" );
+        // case OP_SWAP_HANDLER: {
+        //     ctrl_assert( frame->ip + 1 + 2 + 1 < function->bytecode.size
+        //                , TRAP_IP_OUT_OF_BOUNDS
+        //                , "SWAP_HANDLER: missing variables" );
 
-            uint16_t handler_idx = read16(bytecode, frame->ip + 1);
-            uint8_t      out_idx =  read8(bytecode, frame->ip + 1 + 2);
+        //     uint16_t handler_idx = read16(bytecode, frame->ip + 1);
+        //     uint8_t    inout_idx =  read8(bytecode, frame->ip + 1 + 2);
 
-            ctrl_assert( handler_idx < fiber->handler_vector.handlers.size
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "TAKE_HANDLER: handler index out of bounds" );
+        //     ctrl_assert( handler_idx < fiber->handler_vector.handlers.size
+        //                , TRAP_OPERAND_OUT_OF_BOUNDS
+        //                , "SWAP_HANDLER: handler index out of bounds" );
 
-            ctrl_assert( validate_reg(table, out_idx)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "TAKE_HANDLER: register out of bounds" );
+        //     ctrl_assert( validate_reg(table, inout_idx)
+        //                , TRAP_OPERAND_OUT_OF_BOUNDS
+        //                , "SWAP_HANDLER: register out of bounds" );
 
-            uint8_t* out_reg = &locals[select_reg(frame, out_idx)];
+        //     uint8_t* inout_reg = &locals[select_reg(frame, inout_idx)];
 
-            ctrl_assert( table->layouts.data[out_idx].size >= sizeof(Handler)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "TAKE_HANDLER: out register too small" );
+        //     ctrl_assert( table->layouts.data[inout_idx].size >= sizeof(Handler)
+        //                , TRAP_OPERAND_OUT_OF_BOUNDS
+        //                , "SWAP_HANDLER: inout register too small" );
 
-            Handler* out = (Handler*) out_reg;
+        //     Handler* inout = (Handler*) inout_reg;
 
-            *out = fiber->handler_vector.handlers.data[handler_idx];
+        //     Handler tmp = fiber->handler_vector.handlers.data[handler_idx];
 
-            frame->ip += 1 + 1;
-        } break;
+        //     fiber->handler_vector.handlers.data[handler_idx] = *inout;
+        //     *inout = tmp;
+
+        //     frame->ip += 1 + 2;
+        // } break;
 
 
-        case OP_REMOVE_HANDLER: {
-            ctrl_assert( frame->ip + 1 + 2 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "REMOVE_HANDLER: missing variables" );
+        // case OP_COPY_HANDLER: {
+        //     ctrl_assert( frame->ip + 1 + 2 + 1 < function->bytecode.size
+        //                , TRAP_IP_OUT_OF_BOUNDS
+        //                , "TAKE_HANDLER: missing variables" );
 
-            uint16_t handler_idx = read16(bytecode, frame->ip + 1);
+        //     uint16_t handler_idx = read16(bytecode, frame->ip + 1);
+        //     uint8_t      out_idx =  read8(bytecode, frame->ip + 1 + 2);
 
-            ctrl_assert( handler_idx < fiber->handler_vector.handlers.size
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "REMOVE_HANDLER: handler index out of bounds" );
+        //     ctrl_assert( handler_idx < fiber->handler_vector.handlers.size
+        //                , TRAP_OPERAND_OUT_OF_BOUNDS
+        //                , "TAKE_HANDLER: handler index out of bounds" );
 
-            memmove( &fiber->handler_vector.handlers.data[handler_idx]
-                   , &fiber->handler_vector.handlers.data[handler_idx + 1]
-                   , (fiber->handler_vector.handlers.size - handler_idx - 1) * sizeof(Handler));
+        //     ctrl_assert( validate_reg(table, out_idx)
+        //                , TRAP_OPERAND_OUT_OF_BOUNDS
+        //                , "TAKE_HANDLER: register out of bounds" );
 
-            frame->ip += 1 + 2;
-        } break;
+        //     uint8_t* out_reg = &locals[select_reg(frame, out_idx)];
+
+        //     ctrl_assert( table->layouts.data[out_idx].size >= sizeof(Handler)
+        //                , TRAP_OPERAND_OUT_OF_BOUNDS
+        //                , "TAKE_HANDLER: out register too small" );
+
+        //     Handler* out = (Handler*) out_reg;
+
+        //     *out = fiber->handler_vector.handlers.data[handler_idx];
+
+        //     frame->ip += 1 + 1;
+        // } break;
+
+
+        // case OP_REMOVE_HANDLER: {
+        //     ctrl_assert( frame->ip + 1 + 2 < function->bytecode.size
+        //                , TRAP_IP_OUT_OF_BOUNDS
+        //                , "REMOVE_HANDLER: missing variables" );
+
+        //     uint16_t handler_idx = read16(bytecode, frame->ip + 1);
+
+        //     ctrl_assert( handler_idx < fiber->handler_vector.handlers.size
+        //                , TRAP_OPERAND_OUT_OF_BOUNDS
+        //                , "REMOVE_HANDLER: handler index out of bounds" );
+
+        //     memmove( &fiber->handler_vector.handlers.data[handler_idx]
+        //            , &fiber->handler_vector.handlers.data[handler_idx + 1]
+        //            , (fiber->handler_vector.handlers.size - handler_idx - 1) * sizeof(Handler));
+
+        //     frame->ip += 1 + 2;
+        // } break;
 
 
         case OP_UP_VALUE_ADDR: {
