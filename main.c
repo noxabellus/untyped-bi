@@ -1,8 +1,10 @@
+#include "stdlib.h"
 #include "stdio.h"
 #include "stdint.h"
 #include "stdbool.h"
 #include "string.h"
 
+#define todo { fprintf(stderr, "nyi"); exit(1); }
 
 #define SLICE_T(T) struct { T* data; size_t size; }
 #define Slice(T) Slice_ ## T
@@ -62,39 +64,59 @@ typedef ENUM_T(uint8_t) {
     // [(8*NUM_ARGS)xARG_REGS]
     OP_CALL,
 
+    // prompt the handler at a given HANDLER_INDEX
+    // 8xOP + 16xHANDLER_INDEX + 8xCASE_INDEX + 8xNUM_ARGS + 8xRET_REG
+    // [(8*NUM_ARGS)xARG_REGS]
+    OP_PROMPT,
+
     // return from the current function
     // 8xOP
     OP_RET,
 
-    // jump to the designated offset in the function
-    // 8xOP + 16xOFFSET
-    OP_JMP,
-
-    // jump to the designated offset in the function
-    // if the value stored in COND_REG is non-zero in the lower byte
-    // 8xOP + 16xOFFSET + 8xCOND_REG
-    OP_JMP_IF,
-
-
-    // Prompt the handler at a given HANDLER_INDEX
-    // 8xOP + 16xHANDLER_INDEX + 8xNUM_ARGS + 8xRET_REG
-    // [(8*NUM_ARGS)xARG_REGS]
-    OP_PROMPT,
-
-    // Return control from the current handler
+    // return control from the current handler
     // 8xOP
     OP_CONTINUE,
 
-    // TODO: this would work but it's not very efficient
-    //       as we would need to create lexical closures and WITH calls for every handler
-    // call the function at the address stored in FUN_REG
-    // 8xOP + 16xHANDLER_INDEX + 8xNUM_ARGS + 8xFUN_REG + 8xRET_REG
-    // passing it ARG_REGS as arguments, and placing the result in RET_REG
-    // using the HANDLER provided as an immediate to handle the effect at HANDLER_INDEX
-    // [(8*NUM_ARGS)xARG_REGS]
-    // [sizeof(Handler)xHANDLER]
-    OP_WITH_HANDLER,
 
+    // a block using the HANDLER provided as an immediate to handle the effect at HANDLER_INDEX
+    // 8xOP + 16xHANDLER_INDEX + 8xREG in V blocks
+    // [sizeof(Handler)xHANDLER]
+    OP_WITH_HANDLER, OP_WITH_HANDLER_V,
+
+    // starts a loop block; never yields a value.
+    // also ends a loop block, when used inside a loop with the same LABEL
+    // 8xOP + 16xLABEL
+    OP_LOOP,
+
+    // a pair of if/else blocks
+    // 8xOP + 16xLABEL + 16xLABEL + 8xREG in V blocks
+    OP_COND, OP_COND_V,
+
+    // an unconditional block
+    // 8xOP + 16xLABEL + 8xREG in V blocks
+    OP_BLOCK, OP_BLOCK_V,
+
+    // in a loop, jump to the start of the loop
+    // in any other block, jump to the end, optionally yielding a value
+    // 8xOP + 16xLABEL + 8xREG for the yielded value in V blocks
+    OP_BR,
+
+    // terminate a block, yielding an immediate value to be used as the output value
+    // 8xOP + 16xSIZE
+    // [SIZExIMM]
+    OP_BR_IMM,
+
+    // if the value stored in COND_REG is non-zero in the lower byte,
+    // in a loop, jump to the start of the loop
+    // in any other block, jump to the end, optionally yielding a value
+    // 8xOP + 16xLABEL + 8xCOND_REG + 8xREG for the yielded value in V blocks
+    OP_BR_IF,
+
+    // if the value stored in COND_REG is non-zero in the lower byte,
+    // terminate a block, yielding an immediate value to be used as the output value
+    // 8xOP + 16xLABEL + 8xCOND_REG + 16xSIZE
+    // [SIZExIMM]
+    OP_BR_IF_IMM,
 
 
     // copy the address of a register in a DATA_REG
@@ -103,7 +125,6 @@ typedef ENUM_T(uint8_t) {
     // applying OFFSET to the address
     // 8xOP + 16xOFFSET + 8xADDR_REG
     OP_UP_VALUE_ADDR,
-
 
     // copy the address of DATA_REG into ADDR_REG, applying OFFSET to the address
     // 8xOP + 16xOFFSET + 8xADDR_REG + 8xDATA_REG
@@ -295,8 +316,8 @@ typedef ENUM_T(uint8_t) {
 } OpCode;
 
 typedef struct DataStack DataStack;
+typedef struct Block Block;
 typedef struct Bytecode Bytecode;
-typedef struct BytecodeFunction BytecodeFunction;
 typedef struct Function Function;
 typedef struct Frame Frame;
 typedef struct CallStack CallStack;
@@ -310,18 +331,29 @@ typedef struct Trap Trap;
 
 typedef NativeControl (*Native) (Fiber*);
 
-typedef SLICE_T(uint8_t)  Slice(uint8_t);
-typedef SLICE_T(uint16_t) Slice(uint16_t);
-typedef SLICE_T(Layout)   Slice(Layout);
-typedef SLICE_T(Frame)    Slice(Frame);
-typedef SLICE_T(Function*) Slice(Function*);
-typedef SLICE_T(Handler)  Slice(Handler);
+typedef SLICE_T(uint8_t)   Slice(uint8_t);
+typedef SLICE_T(OpCode)    Slice(OpCode);
+typedef SLICE_T(uint16_t)  Slice(uint16_t);
+typedef SLICE_T(Layout)    Slice(Layout);
+typedef SLICE_T(Block)     Slice(Block);
+typedef SLICE_T(Frame)     Slice(Frame);
+typedef SLICE_T(Function*) Slice(Function);
+typedef SLICE_T(Handler)   Slice(Handler);
 
 
 struct Layout {
     uint16_t size;
     uint16_t align;
 };
+
+struct Block {
+    uint16_t base;
+    uint16_t size;
+    uint16_t parent;
+    uint16_t next;
+};
+
+#define NIL_BLOCK 0xFFFF
 
 struct LayoutTable {
     Slice(Layout) layouts;
@@ -332,12 +364,16 @@ struct LayoutTable {
     uint8_t num_locals;
 };
 
+struct Bytecode {
+    Slice(OpCode) instructions;
+    Slice(Block) blocks;
+};
+
 struct Function {
     LayoutTable table;
     FunctionKind kind;
-    size_t ep;
     union {
-        Slice(uint8_t) bytecode;
+        Bytecode* bytecode;
         Native* native;
     };
 };
@@ -348,7 +384,8 @@ struct Frame {
     Slice(uint16_t) param_offsets;
     size_t old_sp;
     size_t bp;
-    size_t ip;
+    uint16_t ipb;
+    uint16_t ipi;
 };
 
 struct DataStack {
@@ -362,7 +399,7 @@ struct CallStack {
 };
 
 struct Handler {
-    Slice(Function*) cases;
+    Slice(Function) cases;
     size_t fp;
 };
 
@@ -389,39 +426,28 @@ struct Fiber {
 };
 
 
-static inline
-uint8_t read8 (uint8_t const* mem, size_t ip) {
-    return mem[ip];
-}
+#define read8(mem, ip) \
+    (mem[ip])          \
 
-static inline
-uint16_t read16 (uint8_t const* mem, size_t ip) {
-    return (((uint16_t) mem[ip + 0]) << 8)
-         | (((uint16_t) mem[ip + 1]) << 0)
-         ;
-}
+#define read16(mem, ip)                 \
+    ( (((uint16_t) mem[ip + 0]) << 8)   \
+    | (((uint16_t) mem[ip + 1]) << 0) ) \
 
-static inline
-uint32_t read32 (uint8_t const* mem, size_t ip) {
-    return (((uint32_t) mem[ip + 0]) << 24)
-         | (((uint32_t) mem[ip + 1]) << 16)
-         | (((uint32_t) mem[ip + 2]) <<  8)
-         | (((uint32_t) mem[ip + 3]) <<  0)
-         ;
-}
+#define read32(mem, ip)                  \
+    ( (((uint32_t) mem[ip + 0]) << 24)   \
+    | (((uint32_t) mem[ip + 1]) << 16)   \
+    | (((uint32_t) mem[ip + 2]) <<  8)   \
+    | (((uint32_t) mem[ip + 3]) <<  0) ) \
 
-static inline
-uint64_t read64 (uint8_t const* mem, size_t ip) {
-    return (((uint64_t) mem[ip + 0]) << 56)
-         | (((uint64_t) mem[ip + 1]) << 48)
-         | (((uint64_t) mem[ip + 2]) << 40)
-         | (((uint64_t) mem[ip + 3]) << 32)
-         | (((uint64_t) mem[ip + 4]) << 24)
-         | (((uint64_t) mem[ip + 5]) << 16)
-         | (((uint64_t) mem[ip + 6]) <<  8)
-         | (((uint64_t) mem[ip + 7]) <<  0)
-         ;
-}
+#define read64(mem, ip)                  \
+    ( (((uint64_t) mem[ip + 0]) << 56)   \
+    | (((uint64_t) mem[ip + 1]) << 48)   \
+    | (((uint64_t) mem[ip + 2]) << 40)   \
+    | (((uint64_t) mem[ip + 3]) << 32)   \
+    | (((uint64_t) mem[ip + 4]) << 24)   \
+    | (((uint64_t) mem[ip + 5]) << 16)   \
+    | (((uint64_t) mem[ip + 6]) <<  8)   \
+    | (((uint64_t) mem[ip + 7]) <<  0) ) \
 
 
 #define ctrl_trap(trap_kind, trap_message) { \
@@ -433,972 +459,163 @@ uint64_t read64 (uint8_t const* mem, size_t ip) {
 #define ctrl_assert(cond, trap_kind, trap_message)  \
     if (!(cond)) ctrl_trap(trap_kind, trap_message) \
 
+#define calc_padding(addr, align)       \
+    ((addr + align - 1) & ~(align - 1)) \
 
-static inline
-size_t calc_padding (size_t addr, size_t align) {
-    return (addr + align - 1) & ~(align - 1);
-}
+#define validate_reg(table, idx)         \
+    (idx < 128                           \
+        ? idx < table->num_params + 1    \
+        : idx - 128 < table->num_locals) \
 
-static inline
-bool validate_reg (LayoutTable* table, uint8_t idx) {
-    return (idx < 128? idx < table->num_params + 1 : idx - 128 < table->num_locals);
-}
+#define select_reg(frame, idx)                       \
+    (*(idx < 128                                     \
+        ? frame->function->table.local_offsets + idx \
+        : frame->param_offsets.data + (idx - 128)))  \
 
-static inline
-uint16_t select_reg (Frame* frame, uint8_t idx) {
-    uint16_t* a = frame->function->table.local_offsets + idx;
-    uint16_t* b = frame->param_offsets.data + (idx - 128);
-    return *(idx < 128? a : b); // cmovns https://godbolt.org/z/v6r6ThsWf
-}
+#define calc_relative_offset(frame, new_bp, idx)    \
+    (select_reg(frame, idx) + (new_bp - frame->bp)) \
 
-static inline
-uint16_t calc_relative_offset (Frame* frame, size_t new_bp, uint8_t idx) {
-    return select_reg(frame, idx) + (new_bp - frame->bp);
-}
+#define validate_data_pointer(ctx, ptr, size) \
+    (ptr != NULL)                             \
+    // && is_data_addr(ctx, ptr, size);
 
-static inline
-size_t stack_alloc (size_t* sp, size_t size, size_t align) {
-    size_t padding = calc_padding(*sp, align);
+#define validate_function_pointer(ctx, fn) \
+    (fn != NULL)                           \
+    // && is_function_addr(ctx, ptr, size);
 
-    size_t out = *sp + padding;
-    *sp += size + padding;
-
-    return out;
-}
-
-static inline
-bool validate_data_pointer (Context* ctx, uint8_t* ptr, size_t size) {
-    return ptr != NULL
-       ; // && is_data_addr(ctx, ptr, size);
-}
-
-static inline
-bool validate_function_pointer (Context* ctx, Function* fn) {
-    return fn != NULL
-       ; // && is_fun_addr(ctx, fn);
-}
+#define stack_alloc(sp, size, align)        \
+    ( sp += calc_padding(*sp, align) + size \
+    , sp - size )                           \
 
 
 Control step_bc (Fiber* fiber) {
     Frame* frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
     Function* function = frame->function;
-    uint8_t* bytecode = function->bytecode.data;
+    Bytecode* bytecode = function->bytecode;
     LayoutTable* table = &function->table;
 
     uint8_t* locals = &fiber->data_stack.mem.data[frame->bp];
 
-    ctrl_assert( frame->ip < function->bytecode.size
+    ctrl_assert( frame->ipb < bytecode->blocks.size
                , TRAP_IP_OUT_OF_BOUNDS
-               , "IP out of bounds" );
+               , "ipb out of bounds" );
 
-    switch (bytecode[frame->ip]) {
+    ctrl_assert( frame->ipi < bytecode->blocks.data[frame->ipb].size
+               , TRAP_IP_OUT_OF_BOUNDS
+               , "ipi out of bounds" );
+
+    switch (bytecode->instructions.data[bytecode->blocks.data[frame->ipb].base + frame->ipi]) {
         case OP_UNREACHABLE:
             ctrl_trap(TRAP_UNREACHABLE, "unreachable code executed");
 
 
         case OP_NOP: {
-            frame->ip += 1;
+            frame->ipi += 1;
         } break;
 
 
-        case OP_CALL: {
-            ctrl_assert( frame->ip + 1 + 1 + 1 + 1 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "CALL: missing variables" );
-
-            uint8_t num_args = read8(bytecode, frame->ip + 1);
-            uint8_t fun_idx  = read8(bytecode, frame->ip + 1 + 1);
-            uint8_t ret_idx  = read8(bytecode, frame->ip + 1 + 1 + 1);
-
-            ctrl_assert( frame->ip + 4 + num_args < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "CALL: missing arguments" );
-
-            uint8_t* arg_idxs = &bytecode[frame->ip + 1 + 1 + 1 + 1];
-
-            ctrl_assert( validate_reg(table, fun_idx)
-                       & validate_reg(table, ret_idx)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "CALL: register out of bounds" );
-
-            uint8_t* fun_reg = &locals[select_reg(frame, fun_idx)];
-            uint8_t* ret_reg = &locals[select_reg(frame, ret_idx)];
-
-            ctrl_assert( table->layouts.data[fun_idx].size >= sizeof(Function*)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "CALL: fun register too small" );
-
-            Function* new_function = *(Function**) fun_reg;
-
-            ctrl_assert( validate_function_pointer(fiber->context, new_function)
-                       , TRAP_UNEXPECTED
-                       , "CALL: invalid function pointer" );
-
-            size_t num_inputs = new_function->table.num_params + 1;
-
-            size_t sp = fiber->data_stack.sp;
-
-            size_t offsets_sp     = stack_alloc(&sp, num_inputs * sizeof(uint16_t), _Alignof(uint16_t));
-            size_t new_locals_sp  = stack_alloc(&sp, new_function->table.size, new_function->table.align);
-            size_t new_locals_max = new_locals_sp + new_function->table.size;
-
-            ctrl_assert( sp <= fiber->data_stack.mem.size
-                       , TRAP_OPERAND_OVERFLOW
-                       , "CALL: operand stack overflow" );
-
-            ctrl_assert( fiber->call_stack.fp + 1 < fiber->call_stack.frames.size
-                       , TRAP_CALL_OVERFLOW
-                       , "CALL: call stack overflow" );
-
-            fiber->call_stack.fp += 1;
-
-            Frame* new_frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
-            new_frame->function = new_function;
-            new_frame->handler = NULL;
-            new_frame->param_offsets.data = (void*) &fiber->data_stack.mem.data[offsets_sp],
-            new_frame->param_offsets.size = num_inputs + new_function->table.num_locals,
-            new_frame->old_sp = fiber->data_stack.sp,
-            new_frame->bp = new_locals_sp,
-            new_frame->ip = new_function->ep;
-
-            new_frame->param_offsets.data[0] = calc_relative_offset(frame, new_locals_sp, ret_idx);
-
-            switch (num_args) { // loop -> single branch optimization https://godbolt.org/z/6hebcGraz
-                case 0: break;
-
-
-                #define CASE(N)                                                                                         \
-                    case N: {                                                                                           \
-                        ctrl_assert( validate_reg(table, arg_idxs[N - 1])                                               \
-                                   , TRAP_OPERAND_OUT_OF_BOUNDS                                                         \
-                                   , "CALL: argument register out of bounds" );                                         \
-                        new_frame->param_offsets.data[N] = calc_relative_offset(frame, new_locals_sp, arg_idxs[N - 1]); \
-                    }                                                                                                   \
-
-                CASE(128); CASE(127); CASE(126); CASE(125); CASE(124); CASE(123); CASE(122); CASE(121); CASE(120);
-                CASE(119); CASE(118); CASE(117); CASE(116); CASE(115); CASE(114); CASE(113); CASE(112); CASE(111);
-                CASE(110); CASE(109); CASE(108); CASE(107); CASE(106); CASE(105); CASE(104); CASE(103); CASE(102);
-                CASE(101); CASE(100); CASE( 99); CASE( 98); CASE( 97); CASE( 96); CASE( 95); CASE( 94); CASE( 93);
-                CASE( 92); CASE( 91); CASE( 90); CASE( 89); CASE( 88); CASE( 87); CASE( 86); CASE( 85); CASE( 84);
-                CASE( 83); CASE( 82); CASE( 81); CASE( 80); CASE( 79); CASE( 78); CASE( 77); CASE( 76); CASE( 75);
-                CASE( 74); CASE( 73); CASE( 72); CASE( 71); CASE( 70); CASE( 69); CASE( 68); CASE( 67); CASE( 66);
-                CASE( 65); CASE( 64); CASE( 63); CASE( 62); CASE( 61); CASE( 60); CASE( 59); CASE( 58); CASE( 57);
-                CASE( 56); CASE( 55); CASE( 54); CASE( 53); CASE( 52); CASE( 51); CASE( 50); CASE( 49); CASE( 48);
-                CASE( 47); CASE( 46); CASE( 45); CASE( 44); CASE( 43); CASE( 42); CASE( 41); CASE( 40); CASE( 39);
-                CASE( 38); CASE( 37); CASE( 36); CASE( 35); CASE( 34); CASE( 33); CASE( 32); CASE( 31); CASE( 30);
-                CASE( 29); CASE( 28); CASE( 27); CASE( 26); CASE( 25); CASE( 24); CASE( 23); CASE( 22); CASE( 21);
-                CASE( 20); CASE( 19); CASE( 18); CASE( 17); CASE( 16); CASE( 15); CASE( 14); CASE( 13); CASE( 12);
-                CASE( 11); CASE( 10); CASE(  9); CASE(  8); CASE(  7); CASE(  6); CASE(  5); CASE(  4); CASE(  3);
-                CASE(  2); CASE(  1);
-
-                #undef CASE
-
-
-                default:
-                    ctrl_trap(TRAP_UNEXPECTED, "CALL: too many arguments");
-            }
-
-            fiber->data_stack.sp = sp;
-            frame->ip += 1 + 1 + 1 + num_args;
+        OP_CALL: {
+            todo
         } break;
 
 
-        case OP_RET: {
-            // this is completely wrongulent.
-            // the use of handler return cases does not work this way
-            // it could happen in any function, not just handler function calls
-            // and really it depends on the context of the caller not the callee
-            // if (frame->handler && frame->handler->cases.size) {
-            //     Function* return_case = frame->handler->cases.data[0];
-            //     if (return_case) {
-            //         // TODO not sure exactly what needs to happen here
-            //     }
-            // }
-            fiber->data_stack.sp = frame->old_sp;
-            fiber->call_stack.fp -= 1;
+        OP_PROMPT: {
+            todo
         } break;
 
 
-        case OP_JMP: {
-            ctrl_assert( frame->ip + 1 + 2 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "JMP: missing offset" );
-
-            int16_t offset = read16(bytecode, frame->ip + 1);
-
-            ctrl_assert( frame->ip + 1 + 2 + offset < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "JMP: offset out of bounds" );
-
-            frame->ip += 1 + 2 + offset;
+        OP_RET: {
+            todo
         } break;
 
 
-        case OP_JMP_IF: {
-            ctrl_assert( frame->ip + 1 + 2 + 1 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "JMP_IF: missing offset" );
-
-            int16_t   offset = read16(bytecode, frame->ip + 1);
-            uint8_t cond_idx =  read8(bytecode, frame->ip + 1 + 2);
-
-            ctrl_assert( frame->ip + 1 + 2 + 1 + offset < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "JMP: offset out of bounds" );
-
-            ctrl_assert( validate_reg(table, cond_idx)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "JMP_IF: register out of bounds" );
-
-            uint8_t* cond_reg = &locals[select_reg(frame, cond_idx)];
-
-            frame->ip += 1 + 1 + 2;
-
-            if (*cond_reg != 0) {
-                frame->ip += offset;
-            }
+        OP_CONTINUE: {
+            todo
         } break;
 
 
-        case OP_PROMPT: {
-            ctrl_assert( frame->ip + 1 + 2 + 1 + 1 + 1 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "PROMPT: missing variables" );
-
-            uint16_t handler_idx = read16(bytecode, frame->ip + 1);
-            uint8_t     case_idx =  read8(bytecode, frame->ip + 1 + 2);
-            uint8_t     num_args =  read8(bytecode, frame->ip + 1 + 2 + 1);
-            uint8_t      ret_idx =  read8(bytecode, frame->ip + 1 + 2 + 1 + 1);
-
-            ctrl_assert( handler_idx < fiber->handler_vector.handlers.size
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "PROMPT: handler index out of bounds" );
-
-            ctrl_assert( validate_reg(table, ret_idx)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "PROMPT: register out of bounds" );
-
-            ctrl_assert( frame->ip + 1 + 2 + 1 + 1 + 1 + num_args < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "PROMPT: missing arguments" );
-
-            Handler* handler = &fiber->handler_vector.handlers.data[handler_idx];
-
-            ctrl_assert( case_idx + 1 < handler->cases.size
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "PROMPT: case index out of bounds" );
-
-            Function* new_function = handler->cases.data[case_idx + 1];
-
-            size_t num_inputs = new_function->table.num_params + 1;
-
-            size_t sp = fiber->data_stack.sp;
-
-            size_t offsets_sp     = stack_alloc(&sp, num_inputs * sizeof(uint16_t), _Alignof(uint16_t));
-            size_t new_locals_sp  = stack_alloc(&sp, new_function->table.size, new_function->table.align);
-            size_t new_locals_max = new_locals_sp + new_function->table.size;
-
-            ctrl_assert( sp <= fiber->data_stack.mem.size
-                       , TRAP_OPERAND_OVERFLOW
-                       , "PROMPT: operand stack overflow" );
-
-            ctrl_assert( fiber->call_stack.fp + 1 < fiber->call_stack.frames.size
-                       , TRAP_CALL_OVERFLOW
-                       , "PROMPT: call stack overflow" );
-
-            fiber->call_stack.fp += 1;
-
-            Frame* new_frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
-            new_frame->function = new_function;
-            new_frame->handler = handler;
-            new_frame->param_offsets.data = (void*) &fiber->data_stack.mem.data[offsets_sp],
-            new_frame->param_offsets.size = num_inputs + new_function->table.num_locals,
-            new_frame->old_sp = fiber->data_stack.sp,
-            new_frame->bp = new_locals_sp,
-            new_frame->ip = new_function->ep;
-
-            new_frame->param_offsets.data[0] = calc_relative_offset(frame, new_locals_sp, ret_idx);
-
-            switch (num_args) { // loop -> single branch optimization https://godbolt.org/z/6hebcGraz
-                case 0: break;
-
-
-                #define CASE(N)                                                                                         \
-                    case N: {                                                                                           \
-                        ctrl_assert( validate_reg(table, arg_idxs[N - 1])                                               \
-                                   , TRAP_OPERAND_OUT_OF_BOUNDS                                                         \
-                                   , "PROMPT: argument register out of bounds" );                                       \
-                        new_frame->param_offsets.data[N] = calc_relative_offset(frame, new_locals_sp, arg_idxs[N - 1]); \
-                    }                                                                                                   \
-
-                CASE(128); CASE(127); CASE(126); CASE(125); CASE(124); CASE(123); CASE(122); CASE(121); CASE(120);
-                CASE(119); CASE(118); CASE(117); CASE(116); CASE(115); CASE(114); CASE(113); CASE(112); CASE(111);
-                CASE(110); CASE(109); CASE(108); CASE(107); CASE(106); CASE(105); CASE(104); CASE(103); CASE(102);
-                CASE(101); CASE(100); CASE( 99); CASE( 98); CASE( 97); CASE( 96); CASE( 95); CASE( 94); CASE( 93);
-                CASE( 92); CASE( 91); CASE( 90); CASE( 89); CASE( 88); CASE( 87); CASE( 86); CASE( 85); CASE( 84);
-                CASE( 83); CASE( 82); CASE( 81); CASE( 80); CASE( 79); CASE( 78); CASE( 77); CASE( 76); CASE( 75);
-                CASE( 74); CASE( 73); CASE( 72); CASE( 71); CASE( 70); CASE( 69); CASE( 68); CASE( 67); CASE( 66);
-                CASE( 65); CASE( 64); CASE( 63); CASE( 62); CASE( 61); CASE( 60); CASE( 59); CASE( 58); CASE( 57);
-                CASE( 56); CASE( 55); CASE( 54); CASE( 53); CASE( 52); CASE( 51); CASE( 50); CASE( 49); CASE( 48);
-                CASE( 47); CASE( 46); CASE( 45); CASE( 44); CASE( 43); CASE( 42); CASE( 41); CASE( 40); CASE( 39);
-                CASE( 38); CASE( 37); CASE( 36); CASE( 35); CASE( 34); CASE( 33); CASE( 32); CASE( 31); CASE( 30);
-                CASE( 29); CASE( 28); CASE( 27); CASE( 26); CASE( 25); CASE( 24); CASE( 23); CASE( 22); CASE( 21);
-                CASE( 20); CASE( 19); CASE( 18); CASE( 17); CASE( 16); CASE( 15); CASE( 14); CASE( 13); CASE( 12);
-                CASE( 11); CASE( 10); CASE(  9); CASE(  8); CASE(  7); CASE(  6); CASE(  5); CASE(  4); CASE(  3);
-                CASE(  2); CASE(  1);
-
-                #undef CASE
-
-
-                default:
-                    ctrl_trap(TRAP_UNEXPECTED, "PROMPT: too many arguments");
-            }
-
-            fiber->data_stack.sp = sp;
-            frame->ip += 1 + 2 + 1 + 1 + 1 + num_args;
+        OP_WITH_HANDLER: {
+            todo
         } break;
 
 
-        case OP_CONTINUE: {
-            ctrl_assert( frame->handler != NULL
-                       , TRAP_UNEXPECTED
-                       , "CONTINUE: no handler" );
-
-            fiber->data_stack.sp = frame->old_sp;
-            fiber->call_stack.fp -= 1;
+        OP_WITH_HANDLER_V: {
+            todo
         } break;
 
 
-        case OP_NEW_HANDLER: {
-            ctrl_assert( frame->ip + 1 + 1 + 1 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "NEW_HANDLER: missing variables" );
-
-            uint8_t fun_count = read8(bytecode, frame->ip + 1);
-            uint8_t out_idx   = read8(bytecode, frame->ip + 1 + 1);
-
-            ctrl_assert( frame->ip + 1 + 1 + 1 + fun_count < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "NEW_HANDLER: missing functions" );
-
-            uint8_t* fun_idxs = &bytecode[frame->ip + 1 + 1 + 1];
-
-            ctrl_assert( validate_reg(table, out_idx)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "NEW_HANDLER: register out of bounds" );
-
-            uint8_t* out_reg = &locals[select_reg(frame, out_idx)];
-
-            ctrl_assert( table->layouts.data[out_idx].size >= sizeof(Handler)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "NEW_HANDLER: out register too small" );
-
-            Handler* handler = (Handler*) out_reg;
-
-            size_t sp = fiber->data_stack.sp;
-
-            size_t cases_sp = stack_alloc(&sp, fun_count * sizeof(Function), _Alignof(Function));
-
-            ctrl_assert( sp <= fiber->data_stack.mem.size
-                       , TRAP_OPERAND_OVERFLOW
-                       , "NEW_HANDLER: operand stack overflow" );
-
-            Function* cases = (Function*) &fiber->data_stack.mem.data[cases_sp];
-
-            switch (fun_count) {
-                case 0: break;
-
-
-                #define CASE(N)                                                              \
-                    case N: {                                                                \
-                        ctrl_assert( validate_reg(table, fun_idxs[N])                        \
-                                   , TRAP_OPERAND_OUT_OF_BOUNDS                              \
-                                   , "NEW_HANDLER: function register out of bounds" );       \
-                                                                                             \
-                        Function* fun = (Function*) &locals[select_reg(frame, fun_idxs[N])]; \
-                                                                                             \
-                        ctrl_assert( validate_function_pointer(fiber->context, fun)          \
-                                   , TRAP_UNEXPECTED                                         \
-                                   , "NEW_HANDLER: invalid function pointer" );              \
-                                                                                             \
-                        cases[N] = fun;                                                      \
-                    }                                                                        \
-
-                CASE(128); CASE(127); CASE(126); CASE(125); CASE(124); CASE(123); CASE(122); CASE(121); CASE(120);
-                CASE(119); CASE(118); CASE(117); CASE(116); CASE(115); CASE(114); CASE(113); CASE(112); CASE(111);
-                CASE(110); CASE(109); CASE(108); CASE(107); CASE(106); CASE(105); CASE(104); CASE(103); CASE(102);
-                CASE(101); CASE(100); CASE( 99); CASE( 98); CASE( 97); CASE( 96); CASE( 95); CASE( 94); CASE( 93);
-                CASE( 92); CASE( 91); CASE( 90); CASE( 89); CASE( 88); CASE( 87); CASE( 86); CASE( 85); CASE( 84);
-                CASE( 83); CASE( 82); CASE( 81); CASE( 80); CASE( 79); CASE( 78); CASE( 77); CASE( 76); CASE( 75);
-                CASE( 74); CASE( 73); CASE( 72); CASE( 71); CASE( 70); CASE( 69); CASE( 68); CASE( 67); CASE( 66);
-                CASE( 65); CASE( 64); CASE( 63); CASE( 62); CASE( 61); CASE( 60); CASE( 59); CASE( 58); CASE( 57);
-                CASE( 56); CASE( 55); CASE( 54); CASE( 53); CASE( 52); CASE( 51); CASE( 50); CASE( 49); CASE( 48);
-                CASE( 47); CASE( 46); CASE( 45); CASE( 44); CASE( 43); CASE( 42); CASE( 41); CASE( 40); CASE( 39);
-                CASE( 38); CASE( 37); CASE( 36); CASE( 35); CASE( 34); CASE( 33); CASE( 32); CASE( 31); CASE( 30);
-                CASE( 29); CASE( 28); CASE( 27); CASE( 26); CASE( 25); CASE( 24); CASE( 23); CASE( 22); CASE( 21);
-                CASE( 20); CASE( 19); CASE( 18); CASE( 17); CASE( 16); CASE( 15); CASE( 14); CASE( 13); CASE( 12);
-                CASE( 11); CASE( 10); CASE(  9); CASE(  8); CASE(  7); CASE(  6); CASE(  5); CASE(  4); CASE(  3);
-                CASE(  2); CASE(  1);
-
-                #undef CASE
-
-
-                default:
-                    ctrl_trap(TRAP_UNEXPECTED, "NEW_HANDLER: too many functions");
-            }
-
-            handler->cases.data = cases;
-            handler->cases.size = fun_count;
-            handler->fp = fiber->call_stack.fp;
-
-            fiber->data_stack.sp = sp;
-
-            frame->ip += 1 + 1 + 1 + fun_count;
+        OP_LOOP: {
+            todo
         } break;
 
 
-        // case OP_INSERT_HANDLER: {
-        //     ctrl_assert( fiber->handler_vector.handlers.size < fiber->handler_vector.handlers.capacity
-        //                , TRAP_HANDLER_OVERFLOW
-        //                , NULL );
-
-        //     ctrl_assert( frame->ip + 1 + 2 + 1 < function->bytecode.size
-        //                , TRAP_IP_OUT_OF_BOUNDS
-        //                , "INSERT_HANDLER: missing variables" );
-
-        //     uint16_t handler_idx = read16(bytecode, frame->ip + 1);
-        //     uint8_t       in_idx =  read8(bytecode, frame->ip + 1 + 2);
-
-        //     ctrl_assert( validate_reg(table, in_idx)
-        //                , TRAP_OPERAND_OUT_OF_BOUNDS
-        //                , "INSERT_HANDLER: register out of bounds" );
-
-        //     uint8_t* in_reg = &locals[select_reg(frame, in_idx)];
-
-        //     ctrl_assert( table->layouts.data[in_idx].size >= sizeof(Handler)
-        //                , TRAP_OPERAND_OUT_OF_BOUNDS
-        //                , "INSERT_HANDLER: in register too small" );
-
-        //     Handler* handler = (Handler*) in_reg;
-
-        //     ctrl_assert( handler_idx <= fiber->handler_vector.handlers.size
-        //                , TRAP_OPERAND_OUT_OF_BOUNDS
-        //                , "INSERT_HANDLER: handler index out of bounds" );
-
-        //     memmove( &fiber->handler_vector.handlers.data[handler_idx + 1]
-        //            , &fiber->handler_vector.handlers.data[handler_idx]
-        //            , (fiber->handler_vector.handlers.size - handler_idx) * sizeof(Handler));
-
-        //     fiber->handler_vector.handlers.data[handler_idx] = *handler;
-
-        //     frame->ip += 1 + 2 + 1;
-        // } break;
-
-
-        // case OP_SWAP_HANDLER: {
-        //     ctrl_assert( frame->ip + 1 + 2 + 1 < function->bytecode.size
-        //                , TRAP_IP_OUT_OF_BOUNDS
-        //                , "SWAP_HANDLER: missing variables" );
-
-        //     uint16_t handler_idx = read16(bytecode, frame->ip + 1);
-        //     uint8_t    inout_idx =  read8(bytecode, frame->ip + 1 + 2);
-
-        //     ctrl_assert( handler_idx < fiber->handler_vector.handlers.size
-        //                , TRAP_OPERAND_OUT_OF_BOUNDS
-        //                , "SWAP_HANDLER: handler index out of bounds" );
-
-        //     ctrl_assert( validate_reg(table, inout_idx)
-        //                , TRAP_OPERAND_OUT_OF_BOUNDS
-        //                , "SWAP_HANDLER: register out of bounds" );
-
-        //     uint8_t* inout_reg = &locals[select_reg(frame, inout_idx)];
-
-        //     ctrl_assert( table->layouts.data[inout_idx].size >= sizeof(Handler)
-        //                , TRAP_OPERAND_OUT_OF_BOUNDS
-        //                , "SWAP_HANDLER: inout register too small" );
-
-        //     Handler* inout = (Handler*) inout_reg;
-
-        //     Handler tmp = fiber->handler_vector.handlers.data[handler_idx];
-
-        //     fiber->handler_vector.handlers.data[handler_idx] = *inout;
-        //     *inout = tmp;
-
-        //     frame->ip += 1 + 2;
-        // } break;
-
-
-        // case OP_COPY_HANDLER: {
-        //     ctrl_assert( frame->ip + 1 + 2 + 1 < function->bytecode.size
-        //                , TRAP_IP_OUT_OF_BOUNDS
-        //                , "TAKE_HANDLER: missing variables" );
-
-        //     uint16_t handler_idx = read16(bytecode, frame->ip + 1);
-        //     uint8_t      out_idx =  read8(bytecode, frame->ip + 1 + 2);
-
-        //     ctrl_assert( handler_idx < fiber->handler_vector.handlers.size
-        //                , TRAP_OPERAND_OUT_OF_BOUNDS
-        //                , "TAKE_HANDLER: handler index out of bounds" );
-
-        //     ctrl_assert( validate_reg(table, out_idx)
-        //                , TRAP_OPERAND_OUT_OF_BOUNDS
-        //                , "TAKE_HANDLER: register out of bounds" );
-
-        //     uint8_t* out_reg = &locals[select_reg(frame, out_idx)];
-
-        //     ctrl_assert( table->layouts.data[out_idx].size >= sizeof(Handler)
-        //                , TRAP_OPERAND_OUT_OF_BOUNDS
-        //                , "TAKE_HANDLER: out register too small" );
-
-        //     Handler* out = (Handler*) out_reg;
-
-        //     *out = fiber->handler_vector.handlers.data[handler_idx];
-
-        //     frame->ip += 1 + 1;
-        // } break;
-
-
-        // case OP_REMOVE_HANDLER: {
-        //     ctrl_assert( frame->ip + 1 + 2 < function->bytecode.size
-        //                , TRAP_IP_OUT_OF_BOUNDS
-        //                , "REMOVE_HANDLER: missing variables" );
-
-        //     uint16_t handler_idx = read16(bytecode, frame->ip + 1);
-
-        //     ctrl_assert( handler_idx < fiber->handler_vector.handlers.size
-        //                , TRAP_OPERAND_OUT_OF_BOUNDS
-        //                , "REMOVE_HANDLER: handler index out of bounds" );
-
-        //     memmove( &fiber->handler_vector.handlers.data[handler_idx]
-        //            , &fiber->handler_vector.handlers.data[handler_idx + 1]
-        //            , (fiber->handler_vector.handlers.size - handler_idx - 1) * sizeof(Handler));
-
-        //     frame->ip += 1 + 2;
-        // } break;
-
-
-        case OP_UP_VALUE_ADDR: {
-            Handler* handler = frame->handler;
-
-            ctrl_assert( handler != NULL
-                       , TRAP_UNEXPECTED
-                       , "UP_VALUE_ADDR: no handler" );
-
-            ctrl_assert( frame->ip + 1 + 2 + 1 + 1 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "UP_VALUE_ADDR: missing variables" );
-
-            uint16_t  offset = read16(bytecode, frame->ip + 1);
-            uint8_t addr_idx =  read8(bytecode, frame->ip + 1 + 2);
-            uint8_t data_idx =  read8(bytecode, frame->ip + 1 + 2 + 1);
-
-            Frame* up_frame = fiber->call_stack.frames.data[handler->fp];
-
-            ctrl_assert( validate_reg(table, addr_idx)
-                       & validate_reg(&up_frame->table, data_idx)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "UP_VALUE_ADDR: register out of bounds" );
-
-            uint8_t* addr_reg = &locals[select_reg(frame, addr_idx)];
-            uint8_t* data_reg = &locals[select_reg(up_frame, data_idx)];
-
-            ctrl_assert( table->layouts.data[addr_idx].size >= sizeof(void*)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "UP_VALUE_ADDR: addr register too small" );
-
-            void** addr = (void**) addr_reg;
-
-            ctrl_assert( up_frame->table.layouts.data[data_idx].size > offset
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "UP_VALUE_ADDR: offset out of bounds" );
-
-            *addr = data_reg + offset;
-
-            frame->ip += 1 + 2 + 1 + 1;
+        OP_COND: {
+            todo
         } break;
 
 
-        case OP_ADDR_OF: {
-            ctrl_assert( frame->ip + 1 + 2 + 1 + 1 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "ADDR_OF: missing variables" );
-
-            uint16_t  offset = read16(bytecode, frame->ip + 1);
-            uint8_t addr_idx =  read8(bytecode, frame->ip + 1 + 2);
-            uint8_t data_idx =  read8(bytecode, frame->ip + 1 + 2 + 1);
-
-            ctrl_assert( validate_reg(table, addr_idx)
-                       & validate_reg(table, data_idx)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "ADDR_OF: register out of bounds" );
-
-            uint8_t* addr_reg = &locals[select_reg(frame, addr_idx)];
-            uint8_t* data_reg = &locals[select_reg(frame, data_idx)];
-
-            ctrl_assert( table->layouts.data[addr_idx].size >= sizeof(void*)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "ADDR_OF: addr register too small" );
-
-            void** addr = (void**) addr_reg;
-
-            ctrl_assert( table->layouts.data[data_idx].size > offset
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "ADDR_OF: offset out of bounds" );
-
-            *addr = data_reg + offset;
-
-            frame->ip += 1 + 2 + 1 + 1;
+        OP_COND_V: {
+            todo
         } break;
 
 
-        case OP_STORE_IMM: {
-            ctrl_assert( frame->ip + 1 + 2 + 1 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "STORE_IMM: missing variables" );
-
-            uint16_t    size = read16(bytecode, frame->ip + 1);
-            uint8_t addr_idx =  read8(bytecode, frame->ip + 1 + 2);
-
-            ctrl_assert( frame->ip + 4 + size < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "STORE_IMM: missing immediate data" );
-
-            ctrl_assert( validate_reg(table, addr_idx)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "STORE_IMM: register out of bounds" );
-
-            uint8_t* addr_reg = &locals[select_reg(frame, addr_idx)];
-
-            ctrl_assert( table->layouts.data[addr_idx].size >= sizeof(void*)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "STORE_IMM: addr register too small" );
-
-            void* addr = *(void**) addr_reg;
-
-            ctrl_assert( validate_data_pointer(fiber->context, addr, size)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "STORE_IMM: invalid dest addr" );
-
-            memcpy(addr, &bytecode[frame->ip + 1 + 1 + 2], size);
-
-            frame->ip += 1 + 1 + 2 + size;
+        OP_BLOCK: {
+            todo
         } break;
 
 
-        case OP_STORE: {
-            ctrl_assert( frame->ip + 1 + 1 + 1 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "STORE: missing variables" );
-
-            uint8_t addr_idx = read8(bytecode, frame->ip + 1);
-            uint8_t data_idx = read8(bytecode, frame->ip + 1 + 1);
-
-            ctrl_assert( validate_reg(table, addr_idx)
-                       & validate_reg(table, data_idx)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "STORE: register out of bounds" );
-
-            uint8_t* addr_reg = &locals[select_reg(frame, addr_idx)];
-            uint8_t* data_reg = &locals[select_reg(frame, data_idx)];
-
-            ctrl_assert( table->layouts.data[addr_idx].size >= sizeof(void*)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "STORE: addr register too small" );
-
-            void* addr = *(void**) addr_reg;
-
-            ctrl_assert( validate_data_pointer(fiber->context, addr, table->layouts.data[data_idx].size)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "STORE: invalid dest addr" );
-
-            memcpy(addr, data_reg, table->layouts.data[data_idx].size);
-
-            frame->ip += 1 + 1 + 1;
+        OP_BLOCK_V: {
+            todo
         } break;
 
 
-        case OP_LOAD: {
-            ctrl_assert( frame->ip + 1 + 1 + 1 < function->bytecode.size
-                       , TRAP_IP_OUT_OF_BOUNDS
-                       , "LOAD: missing variables" );
-
-            uint8_t addr_idx = read8(bytecode, frame->ip + 1);
-            uint8_t data_idx = read8(bytecode, frame->ip + 1 + 1);
-
-            ctrl_assert( validate_reg(table, addr_idx)
-                       & validate_reg(table, data_idx)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "LOAD: register out of bounds" );
-
-            uint8_t* addr_reg = &locals[select_reg(frame, addr_idx)];
-            uint8_t* data_reg = &locals[select_reg(frame, data_idx)];
-
-            ctrl_assert( table->layouts.data[addr_idx].size >= sizeof(void*)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "LOAD: addr register too small" );
-
-            void* addr = *(void**) addr_reg;
-
-            ctrl_assert( validate_data_pointer(fiber->context, addr, table->layouts.data[data_idx].size)
-                       , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "LOAD: invalid src addr" );
-
-            memcpy(data_reg, addr, table->layouts.data[data_idx].size);
-
-            frame->ip += 1 + 1 + 1;
+        OP_BR: {
+            todo
         } break;
 
 
-        #define BIN(NAME, OP, TYPE, SIZE)                                         \
-            case OP_ ## NAME ## SIZE: {                                           \
-                ctrl_assert(frame->ip + 1 + 1 + 1 + 1 < function->bytecode.size   \
-                           , TRAP_IP_OUT_OF_BOUNDS, #NAME ": missing operands" ); \
-                                                                                  \
-                uint8_t out_idx = read8(bytecode, frame->ip + 1);                 \
-                uint8_t lhs_idx = read8(bytecode, frame->ip + 1 + 1);             \
-                uint8_t rhs_idx = read8(bytecode, frame->ip + 1 + 1 + 1);         \
-                                                                                  \
-                ctrl_assert( validate_reg(table, out_idx)                         \
-                           & validate_reg(table, lhs_idx)                         \
-                           & validate_reg(table, rhs_idx)                         \
-                           , TRAP_OPERAND_OUT_OF_BOUNDS                           \
-                           , #NAME ": register out of bounds" );                  \
-                                                                                  \
-                uint8_t* out_reg = &locals[select_reg(frame, out_idx)];           \
-                uint8_t* lhs_reg = &locals[select_reg(frame, lhs_idx)];           \
-                uint8_t* rhs_reg = &locals[select_reg(frame, rhs_idx)];           \
-                                                                                  \
-                ctrl_assert( table->layouts.data[out_idx].size >= SIZE / 8        \
-                           & table->layouts.data[lhs_idx].size >= SIZE / 8        \
-                           & table->layouts.data[rhs_idx].size >= SIZE / 8        \
-                           , TRAP_OPERAND_OUT_OF_BOUNDS                           \
-                           , #NAME ": register too small" );                      \
-                                                                                  \
-                TYPE ## SIZE ## _t* out = (TYPE ## SIZE ## _t*) out_reg;          \
-                TYPE ## SIZE ## _t* lhs = (TYPE ## SIZE ## _t*) lhs_reg;          \
-                TYPE ## SIZE ## _t* rhs = (TYPE ## SIZE ## _t*) rhs_reg;          \
-                                                                                  \
-                *out = *lhs OP *rhs;                                              \
-                                                                                  \
-                frame->ip += 1 + 1 + 1 + 1;                                       \
-            } break;                                                              \
-
-        #define BINx4(NAME, OP, TYPE) \
-            BIN(NAME, OP, TYPE,  8);  \
-            BIN(NAME, OP, TYPE, 16);  \
-            BIN(NAME, OP, TYPE, 32);  \
-            BIN(NAME, OP, TYPE, 64);  \
-
-        #define BINx2(NAME, OP, TYPE) \
-            BIN(NAME, OP, TYPE, 32);  \
-            BIN(NAME, OP, TYPE, 64);  \
-
-        BINx4(IADD, +, uint);
-        BINx4(ISUB, -, uint);
-        BINx4(IMUL, *, uint);
-        BINx4(UDIV, /, uint);
-        BINx4(SDIV, /,  int);
-        BINx4(UMOD, %, uint);
-        BINx4(SMOD, %,  int);
-
-        BINx2(FADD, +, float);
-        BINx2(FSUB, -, float);
-        BINx2(FMUL, *, float);
-        BINx2(FDIV, /, float);
-        // BINx2(FMOD, %, float);
-
-        BINx4( SHL, <<, uint);
-        BINx4(LSHR, >>, uint);
-        BINx4(ASHR, >>,  int);
-        BINx4(BAND,  &, uint);
-        BINx4( BOR,  |, uint);
-        BINx4(BXOR,  ^, uint);
-
-        #undef BIN
-        #undef BINx4
-        #undef BINx2
+        OP_BR_IMM: {
+            todo
+        } break;
 
 
-        #define UN(NAME, OP, TYPE, SIZE)                                          \
-            case OP_ ## NAME ## SIZE: {                                           \
-                ctrl_assert(frame->ip + 1 + 1 + 1 < function->bytecode.size       \
-                           , TRAP_IP_OUT_OF_BOUNDS, #NAME ": missing operands" ); \
-                                                                                  \
-                uint8_t out_idx = read8(bytecode, frame->ip + 1);                 \
-                uint8_t val_idx = read8(bytecode, frame->ip + 1 + 1);             \
-                                                                                  \
-                ctrl_assert( validate_reg(table, out_idx)                         \
-                           & validate_reg(table, val_idx)                         \
-                           , TRAP_OPERAND_OUT_OF_BOUNDS                           \
-                           , #NAME ": register out of bounds" );                  \
-                                                                                  \
-                uint8_t* out_reg = &locals[select_reg(frame, out_idx)];           \
-                uint8_t* val_reg = &locals[select_reg(frame, val_idx)];           \
-                                                                                  \
-                ctrl_assert( table->layouts.data[out_idx].size >= SIZE / 8        \
-                           & table->layouts.data[val_idx].size >= SIZE / 8        \
-                           , TRAP_OPERAND_OUT_OF_BOUNDS                           \
-                           , #NAME ": register too small" );                      \
-                                                                                  \
-                TYPE ## SIZE ## _t* out = (TYPE ## SIZE ## _t*) out_reg;          \
-                TYPE ## SIZE ## _t* val = (TYPE ## SIZE ## _t*) val_reg;          \
-                                                                                  \
-                *out = OP *val;                                                   \
-                                                                                  \
-                frame->ip += 1 + 1 + 1;                                           \
-            } break;                                                              \
-
-        #define UNx4(NAME, OP, TYPE) \
-            UN(NAME, OP, TYPE,  8);  \
-            UN(NAME, OP, TYPE, 16);  \
-            UN(NAME, OP, TYPE, 32);  \
-            UN(NAME, OP, TYPE, 64);  \
-
-        #define UNx2(NAME, OP, TYPE) \
-            UN(NAME, OP, TYPE, 32);  \
-            UN(NAME, OP, TYPE, 64);  \
-
-        UNx4(INEG, -,   int);
-        UNx2(FNEG, -, float);
-        UNx4(BNOT, ~,  uint);
-
-        #undef UN
-        #undef UNx4
-        #undef UNx2
+        OP_BR_IF: {
+            todo
+        } break;
 
 
-        #define CMP(NAME, OP, TYPE, SIZE)                                        \
-            case OP_ ## NAME ## SIZE: {                                          \
-                ctrl_assert( frame->ip + 1 + 1 + 1 + 1 < function->bytecode.size \
-                           , TRAP_IP_OUT_OF_BOUNDS                               \
-                           , #NAME ": missing operands" );                       \
-                                                                                 \
-                uint8_t out_idx = read8(bytecode, frame->ip + 1);                \
-                uint8_t lhs_idx = read8(bytecode, frame->ip + 1 + 1);            \
-                uint8_t rhs_idx = read8(bytecode, frame->ip + 1 + 1 + 1);        \
-                                                                                 \
-                ctrl_assert( validate_reg(table, out_idx)                        \
-                           & validate_reg(table, lhs_idx)                        \
-                           & validate_reg(table, rhs_idx)                        \
-                           , TRAP_OPERAND_OUT_OF_BOUNDS                          \
-                           , #NAME ": register out of bounds" );                 \
-                                                                                 \
-                uint8_t* out_reg = &locals[select_reg(frame, out_idx)];          \
-                uint8_t* lhs_reg = &locals[select_reg(frame, lhs_idx)];          \
-                uint8_t* rhs_reg = &locals[select_reg(frame, rhs_idx)];          \
-                                                                                 \
-                ctrl_assert( table->layouts.data[out_idx].size >= sizeof(bool)   \
-                           & table->layouts.data[lhs_idx].size >= SIZE / 8       \
-                           & table->layouts.data[rhs_idx].size >= SIZE / 8       \
-                           , TRAP_OPERAND_OUT_OF_BOUNDS                          \
-                           , #NAME ": register too small" );                     \
-                                                                                 \
-                bool* out = (bool*) out_reg;                                     \
-                TYPE ## SIZE ## _t* lhs = (TYPE ## SIZE ## _t*) lhs_reg;         \
-                TYPE ## SIZE ## _t* rhs = (TYPE ## SIZE ## _t*) rhs_reg;         \
-                                                                                 \
-                *out = *lhs == *rhs;                                             \
-                                                                                 \
-                frame->ip += 1 + 1 + 1 + 1;                                      \
-            } break;                                                             \
-
-        #define CMPx4(NAME, OP, TYPE) \
-            CMP(NAME, OP, TYPE, 8);   \
-            CMP(NAME, OP, TYPE, 16);  \
-            CMP(NAME, OP, TYPE, 32);  \
-            CMP(NAME, OP, TYPE, 64);  \
-
-        #define CMPx2(NAME, OP, TYPE) \
-            CMP(NAME, OP, TYPE, 32);  \
-            CMP(NAME, OP, TYPE, 64);  \
-
-        CMPx4(IEQ, ==, uint);
-        CMPx4(INE, !=, uint);
-        CMPx4(ILT, <,  uint);
-        CMPx4(ILE, <=, uint);
-        CMPx4(IGT, >,  uint);
-        CMPx4(IGE, >=, uint);
-
-        CMPx2(FEQ, ==, float);
-        CMPx2(FNE, !=, float);
-        CMPx2(FLT, <,  float);
-        CMPx2(FLE, <=, float);
-        CMPx2(FGT, >,  float);
-        CMPx2(FGE, >=, float);
-
-        #undef CMP
-        #undef CMPx4
-        #undef CMPx2
+        OP_BR_IF_IMM: {
+            todo
+        } break;
 
 
-        #define CAST(NAME, TYPE_A, TYPE_B, SIZE_A, SIZE_B)                        \
-            case OP_ ## NAME: {                                                   \
-                ctrl_assert( frame->ip + 1 + 1 + 1 < function->bytecode.size      \
-                           , TRAP_IP_OUT_OF_BOUNDS                                \
-                           , #NAME ": missing operands" );                        \
-                                                                                  \
-                uint8_t out_idx = read8(bytecode, frame->ip + 1);                 \
-                uint8_t in_idx  = read8(bytecode, frame->ip + 1 + 1);             \
-                                                                                  \
-                ctrl_assert( validate_reg(table, out_idx)                         \
-                           & validate_reg(table, in_idx)                          \
-                           , TRAP_OPERAND_OUT_OF_BOUNDS                           \
-                           , #NAME ": register out of bounds" );                  \
-                                                                                  \
-                uint8_t* out_reg = &locals[select_reg(frame, out_idx)];           \
-                uint8_t* in_reg  = &locals[select_reg(frame, in_idx)];            \
-                                                                                  \
-                ctrl_assert( table->layouts.data[out_idx].size >= SIZE_B / 8      \
-                           & table->layouts.data[in_idx].size  >= SIZE_A / 8      \
-                           , TRAP_OPERAND_OUT_OF_BOUNDS                           \
-                           , #NAME ": register too small" );                      \
-                                                                                  \
-                TYPE_B ## SIZE_B ## _t* out = (TYPE_B ## SIZE_B ## _t*) out_reg;  \
-                TYPE_A ## SIZE_A ## _t*  in = (TYPE_A ## SIZE_A ## _t*) in_reg;   \
-                                                                                  \
-                *out = (TYPE_B ## SIZE_B ## _t) *in;                              \
-                                                                                  \
-                frame->ip += 1 + 1 + 1;                                           \
-            } break;                                                              \
+        OP_UP_VALUE_ADDR: {
+            todo
+        } break;
 
-        CAST( ZEXT_8_16, uint, uint,  8, 16);
-        CAST( ZEXT_8_32, uint, uint,  8, 32);
-        CAST( ZEXT_8_64, uint, uint,  8, 64);
-        CAST(ZEXT_16_32, uint, uint, 16, 32);
-        CAST(ZEXT_16_64, uint, uint, 16, 64);
-        CAST(ZEXT_32_64, uint, uint, 32, 64);
 
-        CAST( SEXT_8_16, int, int,  8, 16);
-        CAST( SEXT_8_32, int, int,  8, 32);
-        CAST( SEXT_8_64, int, int,  8, 64);
-        CAST(SEXT_16_32, int, int, 16, 32);
-        CAST(SEXT_16_64, int, int, 16, 64);
-        CAST(SEXT_32_64, int, int, 32, 64);
+        OP_ADDR_OF: {
+            todo
+        } break;
 
-        CAST(ITRUNC_64_32, uint, uint, 64, 32);
-        CAST(ITRUNC_64_16, uint, uint, 64, 16);
-        CAST( ITRUNC_64_8, uint, uint, 64,  8);
-        CAST(ITRUNC_32_16, uint, uint, 32, 16);
-        CAST( ITRUNC_32_8, uint, uint, 32,  8);
-        CAST( ITRUNC_16_8, uint, uint, 16,  8);
 
-        CAST(  FEXT, float, float, 32, 64);
-        CAST(FTRUNC, float, float, 64, 32);
+        OP_STORE_IMM: {
+            todo
+        } break;
 
-        CAST(S32_TO_F32,   int, float, 32, 32);
-        CAST(U32_TO_F32,  uint, float, 32, 32);
-        CAST(S64_TO_F64,   int, float, 64, 64);
-        CAST(U64_TO_F64,  uint, float, 64, 64);
-        CAST(F32_TO_S32, float,   int, 32, 32);
-        CAST(F32_TO_U32, float,  uint, 32, 32);
-        CAST(F64_TO_S64, float,   int, 64, 64);
-        CAST(F64_TO_U64, float,  uint, 64, 64);
 
-        #undef CAST
+        OP_STORE: {
+            todo
+        } break;
+
+
+        OP_LOAD: {
+            todo
+        } break;
 
 
         default:
-            ctrl_trap(TRAP_UNEXPECTED, "unknown opcode");
+            ctrl_trap(TRAP_UNEXPECTED, "Unexpected opcode");
     }
 
     return CTRL_EXEC;
