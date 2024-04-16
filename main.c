@@ -461,28 +461,39 @@ struct Fiber {
 };
 
 
-#define read8(mem, ip) \
-    (mem[ip])          \
+#define validate_ip(offset) \
+    ctrl_assert( block_frame->ipi + (offset) < bytecode->blocks.data[block_frame->ipb].size \
+               , TRAP_IP_OUT_OF_BOUNDS                                                      \
+               , "ipi out of bounds" );                                                     \
 
-#define read16(mem, ip)                 \
-    ( (((uint16_t) mem[ip + 0]) << 8)   \
-    | (((uint16_t) mem[ip + 1]) << 0) ) \
+#define IP(offset)                                                               \
+    (bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + (offset)) \
 
-#define read32(mem, ip)                  \
-    ( (((uint32_t) mem[ip + 0]) << 24)   \
-    | (((uint32_t) mem[ip + 1]) << 16)   \
-    | (((uint32_t) mem[ip + 2]) <<  8)   \
-    | (((uint32_t) mem[ip + 3]) <<  0) ) \
+#define read8(offset)                         \
+    (bytecode->instructions.data[IP(offset)]) \
 
-#define read64(mem, ip)                  \
-    ( (((uint64_t) mem[ip + 0]) << 56)   \
-    | (((uint64_t) mem[ip + 1]) << 48)   \
-    | (((uint64_t) mem[ip + 2]) << 40)   \
-    | (((uint64_t) mem[ip + 3]) << 32)   \
-    | (((uint64_t) mem[ip + 4]) << 24)   \
-    | (((uint64_t) mem[ip + 5]) << 16)   \
-    | (((uint64_t) mem[ip + 6]) <<  8)   \
-    | (((uint64_t) mem[ip + 7]) <<  0) ) \
+#define read16(offset)                                                  \
+    ( (((uint16_t) bytecode->instructions.data[IP(offset) + 0]) << 8)   \
+    | (((uint16_t) bytecode->instructions.data[IP(offset) + 1]) << 0) ) \
+
+#define read32(offset)                                                   \
+    ( (((uint32_t) bytecode->instructions.data[IP(offset) + 0]) << 24)   \
+    | (((uint32_t) bytecode->instructions.data[IP(offset) + 1]) << 16)   \
+    | (((uint32_t) bytecode->instructions.data[IP(offset) + 2]) <<  8)   \
+    | (((uint32_t) bytecode->instructions.data[IP(offset) + 3]) <<  0) ) \
+
+#define read64(offset)                                                   \
+    ( (((uint64_t) bytecode->instructions.data[IP(offset) + 0]) << 56)   \
+    | (((uint64_t) bytecode->instructions.data[IP(offset) + 1]) << 48)   \
+    | (((uint64_t) bytecode->instructions.data[IP(offset) + 2]) << 40)   \
+    | (((uint64_t) bytecode->instructions.data[IP(offset) + 3]) << 32)   \
+    | (((uint64_t) bytecode->instructions.data[IP(offset) + 4]) << 24)   \
+    | (((uint64_t) bytecode->instructions.data[IP(offset) + 5]) << 16)   \
+    | (((uint64_t) bytecode->instructions.data[IP(offset) + 6]) <<  8)   \
+    | (((uint64_t) bytecode->instructions.data[IP(offset) + 7]) <<  0) ) \
+
+#define IMM(offset)                            \
+    (&bytecode->instructions.data[IP(offset)]) \
 
 
 #define ctrl_trap(trap_kind, trap_message) { \
@@ -494,55 +505,52 @@ struct Fiber {
 #define ctrl_assert(cond, trap_kind, trap_message)  \
     if (!(cond)) ctrl_trap(trap_kind, trap_message) \
 
-#define calc_padding(addr, align)       \
-    ((addr + align - 1) & ~(align - 1)) \
+#define calc_padding(addr, align)             \
+    (((addr) + (align) - 1) & ~((align) - 1)) \
 
-#define validate_reg(table, idx)         \
-    (idx < 128                           \
-        ? idx < table->num_params + 1    \
-        : idx - 128 < table->num_locals) \
+#define validate_reg(table, idx)           \
+    ((idx) < 128                           \
+        ? (idx) < table->num_params + 1    \
+        : (idx) - 128 < table->num_locals) \
 
-#define select_reg(call_frame, idx)                       \
-    (*(idx < 128                                          \
-        ? call_frame->function->table.local_offsets + idx \
-        : call_frame->param_offsets.data + (idx - 128)))  \
+#define select_reg(call_frame, idx)                         \
+    (*((idx) < 128                                          \
+        ? call_frame->function->table.local_offsets + (idx) \
+        : call_frame->param_offsets.data + ((idx) - 128)))  \
 
 #define calc_relative_offset(call_frame, new_bp, idx)    \
-    (select_reg(call_frame, idx) + (new_bp - call_frame->base_sp)) \
+    (select_reg(call_frame, idx) + ((new_bp) - (call_frame)->base_sp)) \
 
-#define validate_data_pointer(ctx, ptr, size) \
-    (ptr != NULL)                             \
+#define validate_data_pointer(ctx, ptr, size)   \
+    ((ptr) != NULL)                             \
     // && is_data_addr(ctx, ptr, size);
 
-#define validate_function_pointer(ctx, fn) \
-    (fn != NULL)                           \
+#define validate_function_pointer(ctx, fn)   \
+    ((fn) != NULL)                           \
     // && is_function_addr(ctx, ptr, size);
 
-#define stack_alloc(sp, size, align)        \
-    ( sp += calc_padding(*sp, align) + size \
-    , sp - size )                           \
+#define stack_alloc(sp, size, align)            \
+    ( (sp) += calc_padding(*sp, align) + (size) \
+    , (sp) - (size) )                           \
 
-#define is_v_block(kind)    \
-    ((kind & 0x10) == 0x10) \
+#define is_v_block(kind)      \
+    (((kind) & 0x10) == 0x10) \
 
 Control step_bc (Fiber* fiber) {
-    CallFrame* call_frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
+    CallFrame*   call_frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
     BlockFrame* block_frame = &fiber->block_stack.frames.data[call_frame->bp];
-    Function* function = call_frame->function;
-    Bytecode* bytecode = function->bytecode;
-    LayoutTable* table = &function->table;
-
-    uint8_t* locals = &fiber->data_stack.mem.data[call_frame->base_sp];
+    Function*      function = call_frame->function;
+    Bytecode*      bytecode = function->bytecode;
+    LayoutTable*      table = &function->table;
+    uint8_t*         locals = &fiber->data_stack.mem.data[call_frame->base_sp];
 
     ctrl_assert( block_frame->ipb < bytecode->blocks.size
                , TRAP_IP_OUT_OF_BOUNDS
                , "ipb out of bounds" );
 
-    ctrl_assert( block_frame->ipi < bytecode->blocks.data[block_frame->ipb].size
-               , TRAP_IP_OUT_OF_BOUNDS
-               , "ipi out of bounds" );
+    validate_ip(0);
 
-    switch (bytecode->instructions.data[bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi]) {
+    switch (read8(0)) {
         case OP_UNREACHABLE:
             ctrl_trap(TRAP_UNREACHABLE, "unreachable code executed");
 
@@ -592,6 +600,11 @@ Control step_bc (Fiber* fiber) {
         } break;
 
 
+        case OP_IF: {
+            todo
+        } break;
+
+
         case OP_IF_ELSE: {
             todo
         } break;
@@ -603,29 +616,24 @@ Control step_bc (Fiber* fiber) {
 
 
         case OP_LOOP: {
-            ctrl_assert( block_frame->ipi + 1 + 2 < bytecode->blocks.data[block_frame->ipb].size
-                       , TRAP_BAD_ENCODE
-                       , "LOOP: missing label" );
-
-            uint16_t label = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1);
-
-            ctrl_assert( label < bytecode->blocks.size
-                       , TRAP_BLOCK_OUT_OF_BOUNDS
-                       , "LOOP: label out of bounds" );
-
             ctrl_assert( fiber->block_stack.fp < fiber->block_stack.frames.size
                        , TRAP_BLOCK_OVERFLOW
                        , "LOOP: block stack overflow" );
 
-            BlockFrame* new_frame = &fiber->block_stack.frames.data[fiber->block_stack.fp];
-
-            call_frame->bp = fiber->block_stack.fp;
+            validate_ip(1 + 2);
+            uint16_t label = read16(1);
+            ctrl_assert( label < bytecode->blocks.size
+                       , TRAP_BLOCK_OUT_OF_BOUNDS
+                       , "LOOP: label out of bounds" );
 
             fiber->block_stack.fp += 1;
 
+            call_frame->bp = fiber->block_stack.fp;
+
+            BlockFrame* new_frame = &fiber->block_stack.frames.data[fiber->block_stack.fp];
             new_frame->kind = BLOCK_LOOP;
-            new_frame->out_idx = 0;
-            new_frame->out_offset = 0;
+            // new_frame->out_idx = 0;
+            // new_frame->out_offset = 0;
             new_frame->ipb = label;
             new_frame->ipi = 0;
 
@@ -634,21 +642,16 @@ Control step_bc (Fiber* fiber) {
 
 
         case OP_REITER: {
-            ctrl_assert( block_frame->ipi + 1 + 2 < bytecode->blocks.data[block_frame->ipb].size
-                       , TRAP_BAD_ENCODE
-                       , "BR_TOP: missing block_offset" );
-
-            uint16_t block_offset = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1);
-
+            validate_ip(1 + 2);
+            uint16_t block_offset = read16(1);
             ctrl_assert( fiber->block_stack.fp >= block_offset
                        , TRAP_BLOCK_OUT_OF_BOUNDS
-                       , "BR_TOP: block_offset out of bounds" );
+                       , "REITER: block_offset out of bounds" );
 
             BlockFrame* loop_frame = &fiber->block_stack.frames.data[fiber->block_stack.fp - block_offset];
-
             ctrl_assert( loop_frame->kind == BLOCK_LOOP
                        , TRAP_BAD_ENCODE
-                       , "BR_TOP: block_offset does not point to a LOOP block" );
+                       , "REITER: block_offset does not point to a LOOP block" );
 
             loop_frame->ipi = 0;
 
@@ -657,97 +660,71 @@ Control step_bc (Fiber* fiber) {
 
 
         case OP_BR: {
-            ctrl_assert( block_frame->ipi + 1 + 2 < bytecode->blocks.data[block_frame->ipb].size
-                       , TRAP_BAD_ENCODE
-                       , "BR: missing block_offset" );
-
-            uint16_t block_offset = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1);
-
-            ctrl_assert( fiber->block_stack.fp >= block_offset
+            validate_ip(1 + 2);
+            uint16_t block_offset = read16(1);
+            ctrl_assert( fiber->block_stack.fp > block_offset
                        , TRAP_BLOCK_OUT_OF_BOUNDS
                        , "BR: block_offset out of bounds" );
 
-            fiber->block_stack.fp -= block_offset;
+            fiber->block_stack.fp -= block_offset + 1;
         } break;
 
 
         case OP_BR_V: {
-            ctrl_assert( block_frame->ipi + 1 + 2 < bytecode->blocks.data[block_frame->ipb].size
-                       , TRAP_BAD_ENCODE
-                       , "BR: missing block_offset" );
-
-            uint16_t block_offset = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1);
-
-            ctrl_assert( fiber->block_stack.fp >= block_offset
+            validate_ip(1 + 2);
+            uint16_t block_offset = read16(1);
+            ctrl_assert( fiber->block_stack.fp > block_offset
                        , TRAP_BLOCK_OUT_OF_BOUNDS
                        , "BR: block_offset out of bounds" );
 
             BlockFrame* break_frame = &fiber->block_stack.frames.data[fiber->block_stack.fp - block_offset];
-
             ctrl_assert( is_v_block(break_frame->kind)
                        , TRAP_BAD_ENCODE
                        , "BR_V: block_offset does not point to a V block" );
 
-            ctrl_assert( block_frame->ipi + 1 + 2 + 1 + 2 + 2 < bytecode->blocks.data[block_frame->ipb].size
-                        , TRAP_BAD_ENCODE
-                        , "BR_V: missing yield register/offset/size" );
-
-            uint8_t     yield_idx =  read8(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1 + 2);
-            uint16_t yield_offset = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1 + 2 + 1);
-            uint16_t   yield_size = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1 + 2 + 1 + 2);
-
+            validate_ip(1 + 2 + 1 + 2 + 2);
+            uint8_t     yield_idx =  read8(1 + 2);
+            uint16_t yield_offset = read16(1 + 2 + 1);
+            uint16_t   yield_size = read16(1 + 2 + 1 + 2);
             ctrl_assert( validate_reg(table, yield_idx)
-                        , TRAP_OPERAND_OUT_OF_BOUNDS
-                        , "BR_V: yield register out of bounds" );
+                       & yield_offset <  table->layouts.data[yield_idx].size
+                       & yield_size   <= table->layouts.data[yield_idx].size - yield_offset
+                       & yield_size   <= table->layouts.data[break_frame->out_idx].size - break_frame->out_offset
+                       , TRAP_OPERAND_OUT_OF_BOUNDS
+                       , "BR_V: yield register/offset out of bounds" );
 
             uint8_t* yield_reg = &locals[select_reg(call_frame, yield_idx)];
             uint8_t*   out_reg = &locals[select_reg(call_frame, break_frame->out_idx)];
-
-            ctrl_assert( yield_offset <  table->layouts.data[yield_idx].size
-                        & yield_size   <= table->layouts.data[yield_idx].size - yield_offset
-                        & yield_size   <= table->layouts.data[break_frame->out_idx].size - break_frame->out_offset
-                        , TRAP_OPERAND_OUT_OF_BOUNDS
-                        , "BR_V: yield offset out of bounds" );
-
             memmove(out_reg + break_frame->out_offset, yield_reg + yield_offset, yield_size);
 
-            fiber->block_stack.fp -= block_offset;
+            fiber->block_stack.fp -= block_offset + 1;
         }
 
 
         case OP_BR_IMM: {
-            ctrl_assert( block_frame->ipi + 1 + 2 + 2 < bytecode->blocks.data[block_frame->ipb].size
-                       , TRAP_BAD_ENCODE
-                       , "BR: missing block_offset/imm_size" );
-
-            uint16_t block_offset = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1);
-            uint16_t     imm_size = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1 + 2);
-
-            ctrl_assert( fiber->block_stack.fp >= block_offset
+            validate_ip(1 + 2 + 2);
+            uint16_t block_offset = read16(1);
+            uint16_t     imm_size = read16(1 + 2);
+            ctrl_assert( fiber->block_stack.fp > block_offset
                        , TRAP_BLOCK_OUT_OF_BOUNDS
-                       , "BR: block_offset out of bounds" );
+                       , "BR_IMM: block_offset out of bounds" );
 
-            ctrl_assert( block_frame->ipi + 1 + 2 + 2 + imm_size < bytecode->blocks.data[block_frame->ipb].size
-                       , TRAP_BAD_ENCODE
-                       , "BR_IMM: missing immediate" );
-
-            uint8_t* imm = &bytecode->instructions.data[bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1 + 2 + 2];
+            validate_ip(1 + 2 + 2 + imm_size);
+            uint8_t* imm = IMM(1 + 2 + 2);
 
             BlockFrame* break_frame = &fiber->block_stack.frames.data[fiber->block_stack.fp - block_offset];
-
             ctrl_assert( is_v_block(break_frame->kind)
                        , TRAP_BAD_ENCODE
-                       , "BR_V: block_offset does not point to a V block" );
-
-            uint8_t*   out_reg = &locals[select_reg(call_frame, break_frame->out_idx)];
+                       , "BR_IMM: block_offset does not point to a V block" );
 
             ctrl_assert( imm_size <= table->layouts.data[break_frame->out_idx].size - break_frame->out_offset
                        , TRAP_OPERAND_OUT_OF_BOUNDS
-                       , "BR_V: yield offset out of bounds" );
+                       , "BR_IMM: yield offset out of bounds" );
 
+            uint8_t* out_reg = &locals[select_reg(call_frame, break_frame->out_idx)];
             memmove(out_reg + break_frame->out_offset, imm, imm_size);
 
-            fiber->block_stack.fp -= block_offset;
+            fiber->block_stack.fp -= block_offset + 1;
         } break;
 
 
