@@ -44,9 +44,20 @@ typedef ENUM_T(uint8_t) {
     TRAP_OPERAND_OVERFLOW,
     TRAP_OPERAND_OUT_OF_BOUNDS,
     TRAP_CALL_OVERFLOW,
+    TRAP_BLOCK_OVERFLOW,
+    TRAP_BLOCK_OUT_OF_BOUNDS,
+    TRAP_BAD_ENCODE,
     TRAP_IP_OUT_OF_BOUNDS,
     TRAP_HANDLER_OVERFLOW,
+    TRAP_HANDLER_OUT_OF_BOUNDS,
 } TrapKind;
+
+typedef ENUM_T(uint8_t) {
+    BLOCK_WITH    = 0x00, BLOCK_WITH_V    = 0x10,
+    BLOCK_BASIC   = 0x01, BLOCK_BASIC_V   = 0x11,
+    BLOCK_IF_ELSE = 0x01, BLOCK_IF_ELSE_V = 0x12,
+    BLOCK_LOOP    = 0x02,
+} BlockKind;
 
 typedef ENUM_T(uint8_t) {
     // triggers a trap if executed
@@ -61,12 +72,12 @@ typedef ENUM_T(uint8_t) {
     // call the function at the address stored in FUN_REG
     // passing it ARG_REGS as arguments, and placing the result in RET_REG
     // 8xOP + 8xNUM_ARGS + 8xFUN_REG + 8xRET_REG
-    // [(8*NUM_ARGS)xARG_REGS]
+    // [8xARG_REG * NUM_ARGS]
     OP_CALL,
 
     // prompt the handler at a given HANDLER_INDEX
     // 8xOP + 16xHANDLER_INDEX + 8xCASE_INDEX + 8xNUM_ARGS + 8xRET_REG
-    // [(8*NUM_ARGS)xARG_REGS]
+    // [8xARG_REG * NUM_ARGS]
     OP_PROMPT,
 
     // return from the current function
@@ -79,42 +90,52 @@ typedef ENUM_T(uint8_t) {
 
 
     // a block using the HANDLER provided as an immediate to handle the effect at HANDLER_INDEX
-    // 8xOP + 16xHANDLER_INDEX + 8xREG in V blocks
+    // 8xOP + 16xHANDLER_INDEX + 8xREG in V blocks + 16xOFFSET in V blocks
     // [sizeof(Handler)xHANDLER]
     OP_WITH_HANDLER, OP_WITH_HANDLER_V,
 
-    // starts a loop block; never yields a value.
-    // also ends a loop block, when used inside a loop with the same LABEL
+    // an unconditional block
+    // 8xOP + 16xLABEL + 8xREG in V blocks + 16xOFFSET in V blocks
+    OP_BLOCK, OP_BLOCK_V,
+
+    // a single conditional block, with no else block, never yielding a value
+    // 8xOP + 16xLABEL + 16xLABEL + 8xREG in V blocks + 16xOFFSET in V blocks
+    OP_IF,
+
+    // a pair of if/else blocks
+    // 8xOP + 16xLABEL + 16xLABEL + 8xREG in V blocks + 16xOFFSET in V blocks
+    OP_IF_ELSE, OP_IF_ELSE_V,
+
+    // a set of blocks to switch over based on the 8-bit index in IDX_REG
+    // 8xOP + 8xIDX_REG + 8xNUM_CASES + 8xREG in V blocks + 16xOFFSET in V blocks
+    // [16xLABEL * NUM_CASES]
+    OP_SWITCH, OP_SWITCH_V,
+
+    // starts a loop block, which never yields a value.
     // 8xOP + 16xLABEL
     OP_LOOP,
 
-    // a pair of if/else blocks
-    // 8xOP + 16xLABEL + 16xLABEL + 8xREG in V blocks
-    OP_COND, OP_COND_V,
+    // restarts a loop block
+    // 8xOP + 16xBLOCK_OFFSET
+    OP_REITER,
 
-    // an unconditional block
-    // 8xOP + 16xLABEL + 8xREG in V blocks
-    OP_BLOCK, OP_BLOCK_V,
-
-    // in a loop, jump to the start of the loop
-    // in any other block, jump to the end, optionally yielding a value
-    // 8xOP + 16xLABEL + 8xREG for the yielded value in V blocks
-    OP_BR,
+    // terminate a block, optionally yielding a value
+    // 8xOP + 16xBLOCK_OFFSET + 8xREG for the yielded value in V blocks + 16xOFFSET in V blocks + 16xSIZE in V blocks
+    OP_BR, OP_BR_V,
 
     // terminate a block, yielding an immediate value to be used as the output value
-    // 8xOP + 16xSIZE
+    // 8xOP + 16xBLOCK_OFFSET + 16xSIZE
     // [SIZExIMM]
     OP_BR_IMM,
 
-    // if the value stored in COND_REG is non-zero in the lower byte,
-    // in a loop, jump to the start of the loop
-    // in any other block, jump to the end, optionally yielding a value
-    // 8xOP + 16xLABEL + 8xCOND_REG + 8xREG for the yielded value in V blocks
-    OP_BR_IF,
+    // terminate a block, if the value stored in COND_REG is non-zero in the lower byte,
+    // optionally yielding a value
+    // 8xOP + 16xBLOCK_OFFSET + 8xCOND_REG + 8xREG for the yielded value in V blocks + 16xOFFSET in V blocks + 16xSIZE in V blocks
+    OP_BR_IF, OP_BR_IF_V,
 
-    // if the value stored in COND_REG is non-zero in the lower byte,
-    // terminate a block, yielding an immediate value to be used as the output value
-    // 8xOP + 16xLABEL + 8xCOND_REG + 16xSIZE
+    // terminate a block, if the value stored in COND_REG is non-zero in the lower byte,
+    // yielding an immediate value to be used as the output value
+    // 8xOP + 16xBLOCK_OFFSET + 8xCOND_REG + 16xSIZE
     // [SIZExIMM]
     OP_BR_IF_IMM,
 
@@ -319,7 +340,9 @@ typedef struct DataStack DataStack;
 typedef struct Block Block;
 typedef struct Bytecode Bytecode;
 typedef struct Function Function;
-typedef struct Frame Frame;
+typedef struct BlockFrame BlockFrame;
+typedef struct CallFrame CallFrame;
+typedef struct BlockStack BlockStack;
 typedef struct CallStack CallStack;
 typedef struct Handler Handler;
 typedef struct HandlerVector HandlerVector;
@@ -331,14 +354,15 @@ typedef struct Trap Trap;
 
 typedef NativeControl (*Native) (Fiber*);
 
-typedef SLICE_T(uint8_t)   Slice(uint8_t);
-typedef SLICE_T(OpCode)    Slice(OpCode);
-typedef SLICE_T(uint16_t)  Slice(uint16_t);
-typedef SLICE_T(Layout)    Slice(Layout);
-typedef SLICE_T(Block)     Slice(Block);
-typedef SLICE_T(Frame)     Slice(Frame);
-typedef SLICE_T(Function*) Slice(Function);
-typedef SLICE_T(Handler)   Slice(Handler);
+typedef SLICE_T(uint8_t)    Slice(uint8_t);
+typedef SLICE_T(OpCode)     Slice(OpCode);
+typedef SLICE_T(uint16_t)   Slice(uint16_t);
+typedef SLICE_T(Layout)     Slice(Layout);
+typedef SLICE_T(Block)      Slice(Block);
+typedef SLICE_T(CallFrame)  Slice(CallFrame);
+typedef SLICE_T(BlockFrame) Slice(BlockFrame);
+typedef SLICE_T(Function*)  Slice(Function);
+typedef SLICE_T(Handler)    Slice(Handler);
 
 
 struct Layout {
@@ -349,8 +373,6 @@ struct Layout {
 struct Block {
     uint16_t base;
     uint16_t size;
-    uint16_t parent;
-    uint16_t next;
 };
 
 #define NIL_BLOCK 0xFFFF
@@ -378,12 +400,19 @@ struct Function {
     };
 };
 
-struct Frame {
+struct CallFrame {
     Function* function;
     Handler* handler;
     Slice(uint16_t) param_offsets;
     size_t old_sp;
-    size_t bp;
+    size_t base_sp;
+    uint16_t bp;
+};
+
+struct BlockFrame {
+    BlockKind kind;
+    uint8_t out_idx;
+    uint16_t out_offset;
     uint16_t ipb;
     uint16_t ipi;
 };
@@ -394,7 +423,12 @@ struct DataStack {
 };
 
 struct CallStack {
-    Slice(Frame) frames;
+    Slice(CallFrame) frames;
+    size_t fp;
+};
+
+struct BlockStack {
+    Slice(BlockFrame) frames;
     size_t fp;
 };
 
@@ -421,6 +455,7 @@ struct Fiber {
     Context* context;
     DataStack data_stack;
     CallStack call_stack;
+    BlockStack block_stack;
     HandlerVector handler_vector;
     Trap trap;
 };
@@ -467,13 +502,13 @@ struct Fiber {
         ? idx < table->num_params + 1    \
         : idx - 128 < table->num_locals) \
 
-#define select_reg(frame, idx)                       \
-    (*(idx < 128                                     \
-        ? frame->function->table.local_offsets + idx \
-        : frame->param_offsets.data + (idx - 128)))  \
+#define select_reg(call_frame, idx)                       \
+    (*(idx < 128                                          \
+        ? call_frame->function->table.local_offsets + idx \
+        : call_frame->param_offsets.data + (idx - 128)))  \
 
-#define calc_relative_offset(frame, new_bp, idx)    \
-    (select_reg(frame, idx) + (new_bp - frame->bp)) \
+#define calc_relative_offset(call_frame, new_bp, idx)    \
+    (select_reg(call_frame, idx) + (new_bp - call_frame->base_sp)) \
 
 #define validate_data_pointer(ctx, ptr, size) \
     (ptr != NULL)                             \
@@ -487,129 +522,271 @@ struct Fiber {
     ( sp += calc_padding(*sp, align) + size \
     , sp - size )                           \
 
+#define is_v_block(kind)    \
+    ((kind & 0x10) == 0x10) \
 
 Control step_bc (Fiber* fiber) {
-    Frame* frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
-    Function* function = frame->function;
+    CallFrame* call_frame = &fiber->call_stack.frames.data[fiber->call_stack.fp];
+    BlockFrame* block_frame = &fiber->block_stack.frames.data[call_frame->bp];
+    Function* function = call_frame->function;
     Bytecode* bytecode = function->bytecode;
     LayoutTable* table = &function->table;
 
-    uint8_t* locals = &fiber->data_stack.mem.data[frame->bp];
+    uint8_t* locals = &fiber->data_stack.mem.data[call_frame->base_sp];
 
-    ctrl_assert( frame->ipb < bytecode->blocks.size
+    ctrl_assert( block_frame->ipb < bytecode->blocks.size
                , TRAP_IP_OUT_OF_BOUNDS
                , "ipb out of bounds" );
 
-    ctrl_assert( frame->ipi < bytecode->blocks.data[frame->ipb].size
+    ctrl_assert( block_frame->ipi < bytecode->blocks.data[block_frame->ipb].size
                , TRAP_IP_OUT_OF_BOUNDS
                , "ipi out of bounds" );
 
-    switch (bytecode->instructions.data[bytecode->blocks.data[frame->ipb].base + frame->ipi]) {
+    switch (bytecode->instructions.data[bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi]) {
         case OP_UNREACHABLE:
             ctrl_trap(TRAP_UNREACHABLE, "unreachable code executed");
 
 
         case OP_NOP: {
-            frame->ipi += 1;
+            block_frame->ipi += 1;
         } break;
 
 
-        OP_CALL: {
+        case OP_CALL: {
             todo
         } break;
 
 
-        OP_PROMPT: {
+        case OP_PROMPT: {
             todo
         } break;
 
 
-        OP_RET: {
+        case OP_RET: {
             todo
         } break;
 
 
-        OP_CONTINUE: {
+        case OP_CONTINUE: {
             todo
         } break;
 
 
-        OP_WITH_HANDLER: {
+        case OP_WITH_HANDLER: {
             todo
         } break;
 
 
-        OP_WITH_HANDLER_V: {
+        case OP_WITH_HANDLER_V: {
             todo
         } break;
 
 
-        OP_LOOP: {
+        case OP_BLOCK: {
             todo
         } break;
 
 
-        OP_COND: {
+        case OP_BLOCK_V: {
             todo
         } break;
 
 
-        OP_COND_V: {
+        case OP_IF_ELSE: {
             todo
         } break;
 
 
-        OP_BLOCK: {
+        case OP_IF_ELSE_V: {
             todo
         } break;
 
 
-        OP_BLOCK_V: {
+        case OP_LOOP: {
+            ctrl_assert( block_frame->ipi + 1 + 2 < bytecode->blocks.data[block_frame->ipb].size
+                       , TRAP_BAD_ENCODE
+                       , "LOOP: missing label" );
+
+            uint16_t label = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1);
+
+            ctrl_assert( label < bytecode->blocks.size
+                       , TRAP_BLOCK_OUT_OF_BOUNDS
+                       , "LOOP: label out of bounds" );
+
+            ctrl_assert( fiber->block_stack.fp < fiber->block_stack.frames.size
+                       , TRAP_BLOCK_OVERFLOW
+                       , "LOOP: block stack overflow" );
+
+            BlockFrame* new_frame = &fiber->block_stack.frames.data[fiber->block_stack.fp];
+
+            call_frame->bp = fiber->block_stack.fp;
+
+            fiber->block_stack.fp += 1;
+
+            new_frame->kind = BLOCK_LOOP;
+            new_frame->out_idx = 0;
+            new_frame->out_offset = 0;
+            new_frame->ipb = label;
+            new_frame->ipi = 0;
+
+            block_frame->ipi += 1 + 2;
+        } break;
+
+
+        case OP_REITER: {
+            ctrl_assert( block_frame->ipi + 1 + 2 < bytecode->blocks.data[block_frame->ipb].size
+                       , TRAP_BAD_ENCODE
+                       , "BR_TOP: missing block_offset" );
+
+            uint16_t block_offset = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1);
+
+            ctrl_assert( fiber->block_stack.fp >= block_offset
+                       , TRAP_BLOCK_OUT_OF_BOUNDS
+                       , "BR_TOP: block_offset out of bounds" );
+
+            BlockFrame* loop_frame = &fiber->block_stack.frames.data[fiber->block_stack.fp - block_offset];
+
+            ctrl_assert( loop_frame->kind == BLOCK_LOOP
+                       , TRAP_BAD_ENCODE
+                       , "BR_TOP: block_offset does not point to a LOOP block" );
+
+            loop_frame->ipi = 0;
+
+            fiber->block_stack.fp -= block_offset;
+        } break;
+
+
+        case OP_BR: {
+            ctrl_assert( block_frame->ipi + 1 + 2 < bytecode->blocks.data[block_frame->ipb].size
+                       , TRAP_BAD_ENCODE
+                       , "BR: missing block_offset" );
+
+            uint16_t block_offset = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1);
+
+            ctrl_assert( fiber->block_stack.fp >= block_offset
+                       , TRAP_BLOCK_OUT_OF_BOUNDS
+                       , "BR: block_offset out of bounds" );
+
+            fiber->block_stack.fp -= block_offset;
+        } break;
+
+
+        case OP_BR_V: {
+            ctrl_assert( block_frame->ipi + 1 + 2 < bytecode->blocks.data[block_frame->ipb].size
+                       , TRAP_BAD_ENCODE
+                       , "BR: missing block_offset" );
+
+            uint16_t block_offset = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1);
+
+            ctrl_assert( fiber->block_stack.fp >= block_offset
+                       , TRAP_BLOCK_OUT_OF_BOUNDS
+                       , "BR: block_offset out of bounds" );
+
+            BlockFrame* break_frame = &fiber->block_stack.frames.data[fiber->block_stack.fp - block_offset];
+
+            ctrl_assert( is_v_block(break_frame->kind)
+                       , TRAP_BAD_ENCODE
+                       , "BR_V: block_offset does not point to a V block" );
+
+            ctrl_assert( block_frame->ipi + 1 + 2 + 1 + 2 + 2 < bytecode->blocks.data[block_frame->ipb].size
+                        , TRAP_BAD_ENCODE
+                        , "BR_V: missing yield register/offset/size" );
+
+            uint8_t     yield_idx =  read8(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1 + 2);
+            uint16_t yield_offset = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1 + 2 + 1);
+            uint16_t   yield_size = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1 + 2 + 1 + 2);
+
+            ctrl_assert( validate_reg(table, yield_idx)
+                        , TRAP_OPERAND_OUT_OF_BOUNDS
+                        , "BR_V: yield register out of bounds" );
+
+            uint8_t* yield_reg = &locals[select_reg(call_frame, yield_idx)];
+            uint8_t*   out_reg = &locals[select_reg(call_frame, break_frame->out_idx)];
+
+            ctrl_assert( yield_offset <  table->layouts.data[yield_idx].size
+                        & yield_size   <= table->layouts.data[yield_idx].size - yield_offset
+                        & yield_size   <= table->layouts.data[break_frame->out_idx].size - break_frame->out_offset
+                        , TRAP_OPERAND_OUT_OF_BOUNDS
+                        , "BR_V: yield offset out of bounds" );
+
+            memmove(out_reg + break_frame->out_offset, yield_reg + yield_offset, yield_size);
+
+            fiber->block_stack.fp -= block_offset;
+        }
+
+
+        case OP_BR_IMM: {
+            ctrl_assert( block_frame->ipi + 1 + 2 + 2 < bytecode->blocks.data[block_frame->ipb].size
+                       , TRAP_BAD_ENCODE
+                       , "BR: missing block_offset/imm_size" );
+
+            uint16_t block_offset = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1);
+            uint16_t     imm_size = read16(bytecode->instructions.data, bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1 + 2);
+
+            ctrl_assert( fiber->block_stack.fp >= block_offset
+                       , TRAP_BLOCK_OUT_OF_BOUNDS
+                       , "BR: block_offset out of bounds" );
+
+            ctrl_assert( block_frame->ipi + 1 + 2 + 2 + imm_size < bytecode->blocks.data[block_frame->ipb].size
+                       , TRAP_BAD_ENCODE
+                       , "BR_IMM: missing immediate" );
+
+            uint8_t* imm = &bytecode->instructions.data[bytecode->blocks.data[block_frame->ipb].base + block_frame->ipi + 1 + 2 + 2];
+
+            BlockFrame* break_frame = &fiber->block_stack.frames.data[fiber->block_stack.fp - block_offset];
+
+            ctrl_assert( is_v_block(break_frame->kind)
+                       , TRAP_BAD_ENCODE
+                       , "BR_V: block_offset does not point to a V block" );
+
+            uint8_t*   out_reg = &locals[select_reg(call_frame, break_frame->out_idx)];
+
+            ctrl_assert( imm_size <= table->layouts.data[break_frame->out_idx].size - break_frame->out_offset
+                       , TRAP_OPERAND_OUT_OF_BOUNDS
+                       , "BR_V: yield offset out of bounds" );
+
+            memmove(out_reg + break_frame->out_offset, imm, imm_size);
+
+            fiber->block_stack.fp -= block_offset;
+        } break;
+
+
+        case OP_BR_IF: {
             todo
         } break;
 
 
-        OP_BR: {
+        case OP_BR_IF_V: {
             todo
         } break;
 
 
-        OP_BR_IMM: {
+        case OP_BR_IF_IMM: {
             todo
         } break;
 
 
-        OP_BR_IF: {
+        case OP_UP_VALUE_ADDR: {
             todo
         } break;
 
 
-        OP_BR_IF_IMM: {
+        case OP_ADDR_OF: {
             todo
         } break;
 
 
-        OP_UP_VALUE_ADDR: {
+        case OP_STORE_IMM: {
             todo
         } break;
 
 
-        OP_ADDR_OF: {
+        case OP_STORE: {
             todo
         } break;
 
 
-        OP_STORE_IMM: {
-            todo
-        } break;
-
-
-        OP_STORE: {
-            todo
-        } break;
-
-
-        OP_LOAD: {
+        case OP_LOAD: {
             todo
         } break;
 
