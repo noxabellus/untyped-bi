@@ -474,7 +474,7 @@ struct Fiber {
 };
 
 
-#define validate_ip(offset) \
+#define validate_ip(offset)                                                                 \
     ctrl_assert( block_frame->ipi + (offset) < bytecode->blocks.data[block_frame->ipb].size \
                , TRAP_IP_OUT_OF_BOUNDS                                                      \
                , "ipi out of bounds" );                                                     \
@@ -534,12 +534,12 @@ struct Fiber {
 #define calc_relative_offset(call_frame, new_bp, idx)    \
     (select_reg(call_frame, idx) + ((new_bp) - (call_frame)->base_sp)) \
 
-#define validate_data_pointer(ctx, ptr, size)   \
-    ((ptr) != NULL)                             \
+#define validate_data_pointer(ctx, ptr, size) \
+    ((ptr) != NULL)                           \
     // && is_data_addr(ctx, ptr, size);
 
-#define validate_function_pointer(ctx, fn)   \
-    ((fn) != NULL)                           \
+#define validate_function_pointer(ctx, fn) \
+    ((fn) != NULL)                         \
     // && is_function_addr(ctx, ptr, size);
 
 #define stack_alloc(sp, size, align)            \
@@ -627,9 +627,9 @@ Control step_bc (Fiber* fiber) {
             ctrl_assert( handler_index <= fiber->handler_vector.hp
                        , TRAP_HANDLER_OUT_OF_BOUNDS
                        , "WITH_HANDLER_V: handler_index out of bounds" );
-            memmove(fiber->handler_vector.handlers.data + handler_index + 1
-                  , fiber->handler_vector.handlers.data + handler_index
-                  , (fiber->handler_vector.hp - handler_index) * sizeof(Handler));
+            memmove( fiber->handler_vector.handlers.data + handler_index + 1
+                   , fiber->handler_vector.handlers.data + handler_index
+                   , (fiber->handler_vector.hp - handler_index) * sizeof(Handler));
 
             Handler* handler = &fiber->handler_vector.handlers.data[handler_index];
             handler->cases.data = cases;
