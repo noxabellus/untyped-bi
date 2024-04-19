@@ -29,14 +29,12 @@ fun maybe_fail action {
             (fail
                 (with
                     (input 'e)
-                    (local ())
                     (output (Maybe 'a)))
-
                 ($entry
                     (STORE_IMM #O @Nothing)
                     (RETURN))))
         (RETURN))
     ($body
-        (CALL 0 #I0 #L0  )              ;; fail called from in here breaks the block
+        (CALL 0 #I0 #L0)                ;; fail called from in here breaks the block
         (BR_V $body #LO 0 (sizeof 'a))) ;; return is called here
 )
